@@ -1,0 +1,15 @@
+{
+  "name": "agent-boxes",
+  "description": "A side bar for Claude Code: Claude, Codex and Antigravity usage meters, what each running agent is doing, the current task, and a recommended next step",
+  "owner": {
+    "name": "Michael Bystryk",
+    "url": "https://github.com/michaelbystryk"
+  },
+  "plugins": [
+    {
+      "name": "agent-boxes",
+      "source": "./",
+      "description": "A side bar for Claude Code: Claude, Codex and Antigravity usage meters, what each running agent is doing, the current task, and a recommended next step"
+    }
+  ]
+}
