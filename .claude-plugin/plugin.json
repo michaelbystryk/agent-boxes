@@ -1,44 +1,11 @@
 {
   "name": "agent-boxes",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A side bar for Claude Code: Claude, Codex and Antigravity usage meters, what each running agent is doing, the current task, and a recommended next step",
   "author": { "name": "Michael Bystryk", "url": "https://github.com/michaelbystryk" },
   "homepage": "https://github.com/michaelbystryk/agent-boxes",
   "repository": "https://github.com/michaelbystryk/agent-boxes",
   "license": "MIT",
   "keywords": ["sidebar", "usage", "rate-limits", "codex", "antigravity", "agents", "tasks"],
-  "types": "./types/index.d.ts",
-  "userConfig": {
-    "brief": {
-      "type": "boolean",
-      "title": "Now / Next summaries",
-      "description": "After each turn, ask a small model what is under way and what to do next (one short call per turn)",
-      "default": true
-    },
-    "briefModel": {
-      "type": "string",
-      "title": "Summary model",
-      "description": "Model alias or id for the Now / Next summaries",
-      "default": "haiku"
-    },
-    "width": {
-      "type": "number",
-      "title": "Side bar width",
-      "description": "Columns the side bar asks for",
-      "default": 48
-    },
-    "background": {
-      "type": "string",
-      "title": "Background",
-      "description": "black paints the boxes with the terminal's black (matches most dark themes); dock keeps the side bar's own colour",
-      "options": ["black", "dock"],
-      "default": "black"
-    },
-    "python": {
-      "type": "string",
-      "title": "Python command",
-      "description": "Python 3.8+ command for the Codex and Antigravity boxes, a path (spaces are fine) or a command with arguments (py -3, 'C:/My Env/python.exe' -X utf8); empty tries python3, python, then py",
-      "default": ""
-    }
-  }
+  "types": "./types/index.d.ts"
 }

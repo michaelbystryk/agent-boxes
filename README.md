@@ -32,8 +32,6 @@ claude plugin install agent-boxes@agent-boxes
 
 Any other chat that's already open needs `/reload-plugins` too.
 
-If the install says "userConfig options not yet set", that's fine: every option has a default. See [Options](#options) to change them.
-
 To update later, run `claude plugin update agent-boxes@agent-boxes`, then `/reload-plugins` in open chats.
 
 ### What it needs
@@ -48,15 +46,19 @@ To update later, run `claude plugin update agent-boxes@agent-boxes`, then `/relo
 
 ## Options
 
-Run `/config` and find **agent-boxes**:
+Installing asks nothing: every option starts at its default. To change one, create `~/.claude/agent-boxes/config.json` (or `$CLAUDE_CONFIG_DIR/agent-boxes/config.json`) with just the options you want, then start a new chat or run `/reload-plugins`:
+
+```json
+{ "width": 56, "background": "dock" }
+```
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| Now / Next summaries | on | After each of Claude's turns, asks a small model what's under way and what to do next. Turn it off to drop the Next box and the extra model call. |
-| Summary model | `haiku` | Model alias or ID used for the summaries. |
-| Side bar width | `48` | Columns the side bar asks for. |
-| Background | `black` | `black` uses a black background with light text so it reads on any theme. `dock` uses the side bar's own colours. |
-| Python command | *(auto)* | Command used to run Python. When empty, it tries `python3`, `python`, then `py` (requiring 3.8+). |
+| `brief` | `true` | After each of Claude's turns, asks a small model what's under way and what to do next. Turn it off to drop the Next box and the extra model call. |
+| `briefModel` | `"haiku"` | Model alias or ID used for the summaries. |
+| `width` | `48` | Columns the side bar asks for. |
+| `background` | `"black"` | `black` uses a black background with light text so it reads on any theme. `dock` uses the side bar's own colours. |
+| `python` | `""` | Command used to run Python, such as `"py -3"` or a full path. When empty, it tries `python3`, `python`, then `py` (requiring 3.8+). |
 
 ## How it works
 
@@ -71,7 +73,7 @@ Everything runs on your own machine. Nothing is sent anywhere except the summary
 ## Troubleshooting
 
 - **No side bar:** check the fullscreen TUI and terminal width (above). It opens by itself from 144 columns, and from 110 once you've opened it with `/agent-boxes`.
-- **"needs Python 3.8+" / Python 2 / macOS `python3` asks for developer tools:** install Python 3 from [python.org](https://www.python.org) or Homebrew, or set the **Python command** option to a working Python 3.8+ interpreter.
+- **"needs Python 3.8+" / Python 2 / macOS `python3` asks for developer tools:** install Python 3 from [python.org](https://www.python.org) or Homebrew, or set the `python` option (see [Options](#options)) to a working Python 3.8+ interpreter.
 - **Codex quota shows `–`:** stays `–` until Codex has logged at least one run in the last 7 days.
 - **Codex runs don't show up:** only runs this chat started with `codex exec` are listed, and only for 12 hours after they start.
 - **Antigravity quota shows `–`:** `agy` must be on `PATH` (on Windows, the default `%LOCALAPPDATA%gyingy.exe` also works) and signed in. The first reading takes a few seconds.

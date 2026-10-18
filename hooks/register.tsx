@@ -21,7 +21,9 @@ const subagents = atom({ plugin: 'agent-boxes', key: 'subagents' } as const, [])
 const brief = atom({ plugin: 'agent-boxes', key: 'brief' } as const, null)
 const tasks = atom({ plugin: 'agent-boxes', key: 'tasks' } as const, [])
 
-// The user's options (userConfig in plugin.json), read once per load.
+// The options: the defaults below, changed by `<claude dir>/agent-boxes/config.json`, read once per
+// session. plugin.json declares no userConfig, because Claude Code asks for every option that has no
+// saved value when the plugin is installed, defaults or not.
 type Config = { brief: boolean; briefModel: string; width: number; background: 'black' | 'dock'; python: string }
 let config: Config = { brief: true, briefModel: 'haiku', width: 48, background: 'black', python: '' }
 
@@ -34,6 +36,19 @@ function readConfig(options: PluginOptions): Config {
     width: Math.min(120, Math.max(30, width)),
     background: options.background === 'dock' ? 'dock' : 'black',
     python: str('python', '').trim(),
+  }
+}
+
+let options: PluginOptions = {}
+
+async function loadConfig($: EngineInterface) {
+  await folders($)
+  const path = `${claudeDir}/agent-boxes/config.json`
+  try {
+    const file: unknown = (await $.fs.exists(path)) ? JSON.parse(await $.fs.read(path)) : {}
+    config = readConfig({ ...options, ...(file && typeof file === 'object' ? (file as PluginOptions) : {}) })
+  } catch {
+    config = readConfig(options)  // an unreadable or broken file keeps the defaults
   }
 }
 
@@ -488,7 +503,8 @@ async function poll($: EngineInterface, isUrgent = false) {
   }
 }
 
-export const register: Register = (on, options) => {
+export const register: Register = (on, given) => {
+  options = given
   config = readConfig(options)
   loadGen++
   isScanning = false
@@ -511,6 +527,7 @@ export const register: Register = (on, options) => {
   isAutoOpenDecided = false
 
   on('session.start', async ($, e, next) => {
+    await loadConfig($)
     await $.command.register({ name: 'agent-boxes', description: 'Show the agent boxes side bar' })
     void measure($)
     void poll($)

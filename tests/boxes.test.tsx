@@ -65,6 +65,8 @@ type Setup = {
   checkMs?: number
   // The main conversation's messages; the default is one request and its reply.
   messages?: SessionMessage[]
+  // agent-boxes/config.json: an object is written as JSON, a string as is; absent by default.
+  config?: object | string
 }
 
 type World = {
@@ -92,6 +94,8 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
   let lists = 0
   const logs: string[] = []
   const taskDir = '/home/u/.claude/tasks/sess-1'
+  const configPath = '/home/u/.claude/agent-boxes/config.json'
+  const { config } = setup
   on('session.id', () => ({ value: 'sess-1' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.usage', () => ({
@@ -106,12 +110,19 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
   }))
   on('env.get', (_$, e) => ({ value: setup.env?.[e.name] ?? (e.name === 'HOME' ? '/home/u' : undefined) }))
   on('fs.exists', (_$, e) => ({
-    value: (unix(e.path) === taskDir && Object.keys(tasks).length > 0) || folders.includes(unix(e.path)),
+    value:
+      (unix(e.path) === taskDir && Object.keys(tasks).length > 0) ||
+      folders.includes(unix(e.path)) ||
+      (config !== undefined && unix(e.path) === configPath),
   }))
   on('fs.list', () => ({
     value: Object.keys(tasks).map(name => ({ name, kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
   }))
-  on('fs.read', (_$, e) => ({ value: JSON.stringify(tasks[unix(e.path).slice(taskDir.length + 1)]) }))
+  on('fs.read', (_$, e) =>
+    unix(e.path) === configPath && config !== undefined
+      ? { value: typeof config === 'string' ? config : JSON.stringify(config) }
+      : { value: JSON.stringify(tasks[unix(e.path).slice(taskDir.length + 1)]) },
+  )
   on('agent.list', () => {
     lists++
     return {
@@ -315,11 +326,18 @@ test('with no Python, an installed tool says what it needs', async ($, on) => {
   await ui.unmount()
 })
 
-test('summaries can be turned off', { options: { brief: false } }, async ($, on) => {
-  await start($, on, { tasks: {} })
+test('summaries can be turned off', async ($, on) => {
+  await start($, on, { tasks: {}, config: { brief: false } })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ key: 'next' })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: /nothing under way/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a broken config file keeps the defaults', async ($, on) => {
+  await start($, on, { config: '{ "brief": fal' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ key: 'next' })).toBeDefined()
   await ui.unmount()
 })
 
@@ -412,8 +430,9 @@ test('waiting on you clears when the user submits a prompt', async ($, on) => {
   await after.unmount()
 })
 
-test('with no task under way, now shows the first pending task', { options: { brief: false } }, async ($, on) => {
+test('with no task under way, now shows the first pending task', async ($, on) => {
   await start($, on, {
+    config: { brief: false },
     tasks: {
       '1.json': { id: '1', subject: 'Write the scan', status: 'pending' },
       '2.json': { id: '2', subject: 'Test it', status: 'pending' },
@@ -502,13 +521,16 @@ test('/clear drops the old conversation summary', async ($, on) => {
   await ui.unmount()
 })
 
-test('a python path with spaces is one argument', { options: { python: '/opt/My Env/bin/python' } }, async ($, on) => {
-  const { checks } = await start($, on, { folders: [...TOOL_FOLDERS, '/opt/My Env/bin/python'] })
+test('a python path with spaces is one argument', async ($, on) => {
+  const { checks } = await start($, on, {
+    folders: [...TOOL_FOLDERS, '/opt/My Env/bin/python'],
+    config: { python: '/opt/My Env/bin/python' },
+  })
   expect(checks()[0]?.[0]).toBe('/opt/My Env/bin/python')
 })
 
-test('a quoted python path keeps its arguments', { options: { python: '"/opt/My Env/python" -X utf8' } }, async ($, on) => {
-  const { checks } = await start($, on)
+test('a quoted python path keeps its arguments', async ($, on) => {
+  const { checks } = await start($, on, { config: { python: '"/opt/My Env/python" -X utf8' } })
   expect(checks()[0]?.slice(0, 3)).toEqual(['/opt/My Env/python', '-X', 'utf8'])
 })
 
@@ -530,8 +552,8 @@ test('an empty HOME falls back to USERPROFILE', async ($, on) => {
   await ui.unmount()
 })
 
-test('the python option takes arguments', { options: { python: 'py -3' } }, async ($, on) => {
-  const { checks, scans } = await start($, on)
+test('the python option takes arguments', async ($, on) => {
+  const { checks, scans } = await start($, on, { config: { python: 'py -3' } })
   expect(checks()[0]).toEqual(['py', '-3', '-E', '-c', 'import sys; sys.exit(sys.version_info < (3, 8))'])
   expect(scans()[0]?.slice(0, 3)).toEqual(['py', '-3', '-E'])
 })
