@@ -143,13 +143,28 @@ export async function refresh($: EngineInterface, scan?: Scan) {
   await update($, routeBox, old => (JSON.stringify(old) === JSON.stringify(next) ? old : next))
 }
 
+// Entries waiting for the history file. One writer drains them, so parallel spawns don't
+// overwrite each other's read-modify-write.
+let pending: string[] = []
+let writing = false
+
 async function log($: EngineInterface, entry: object) {
+  pending.push(JSON.stringify(entry))
+  if (writing) return
+  writing = true
   const path = `${claudeDir}/agent-boxes/router-history.jsonl`
   try {
-    const old = (await $.fs.exists(path)) ? (await $.fs.read(path)).split('\n').filter(Boolean) : []
-    await $.fs.write(path, [...old, JSON.stringify(entry)].slice(-HISTORY_LINES).join('\n') + '\n')
+    while (pending.length) {
+      const batch = pending
+      pending = []
+      const old = (await $.fs.exists(path)) ? (await $.fs.read(path)).split('\n').filter(Boolean) : []
+      await $.fs.write(path, [...old, ...batch].slice(-HISTORY_LINES).join('\n') + '\n')
+    }
   } catch (err) {
+    pending = []
     $.ui.log(`agent-boxes: router history: ${String(err)}`)
+  } finally {
+    writing = false
   }
 }
 

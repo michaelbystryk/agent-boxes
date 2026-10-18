@@ -416,12 +416,21 @@ def transcripts(session_id):
     return paths
 
 
+def via(path):
+    """The subagent whose transcript this is (subagents/agent-<id>.jsonl), or None for a chat's own."""
+    if os.path.basename(os.path.dirname(path)) != "subagents":
+        return None
+    m = re.fullmatch(r"agent-([\w-]+)\.jsonl", os.path.basename(path))
+    return m.group(1) if m else None
+
+
 def session_commands(session_id):
-    """One shared pass for both scanners, including session continuations."""
+    """One shared pass for both scanners, including session continuations. Each call carries
+    `via`: the subagent that ran it, or None for the chat itself."""
     key = (CLAUDE_PROJECTS, session_id)
     if key not in _COMMANDS:
         since = time.time() * 1000 - LOOKBACK_MS
-        _COMMANDS[key] = [c for path in transcripts(session_id)
+        _COMMANDS[key] = [{**c, "via": via(path)} for path in transcripts(session_id)
                           for c in transcript_data(path, since)["calls"] if c["atMs"] >= since]
     return _COMMANDS[key]
 
@@ -429,7 +438,7 @@ def session_commands(session_id):
 def session_calls(session_id):
     """The session's `codex exec` calls: when, the -C dir, and the brief fed on stdin.
     A bench.py launch counts as a call with only its bench dir."""
-    return [c if c["kind"] == "codex" else {"atMs": c["atMs"], "kind": "codex", "cwd": c["cwd"]}
+    return [c if c["kind"] == "codex" else {"atMs": c["atMs"], "kind": "codex", "cwd": c["cwd"], "via": None}
             for c in session_commands(session_id)
             if c["kind"] == "codex" or (c["kind"] == "bench" and c["agent"] == "codex")]
 
@@ -760,7 +769,7 @@ def pair_calls(roots, calls, id_key, time_key, compatible, matches, after):
 
 
 def ours(rows, calls):
-    """The ids of the threads the session's calls started, and their descendants."""
+    """Thread id -> the call that started it, for the session's calls and their descendants."""
     roots = [t for t in rows if parent_of(t["source"]) is None and t["created_at_ms"]]
     identities, budget = {}, [QUOTA_BYTES]
 
@@ -780,14 +789,14 @@ def ours(rows, calls):
             have_cwd, have_prompt = identities[t["id"]]
         return (not cwd or norm_path(have_cwd) == cwd) and (not wanted or any(same_prompt(p, norm_text(have_prompt)) for p in wanted))
 
-    claimed = set(pair_calls(roots, calls, "id", "created_at_ms", compatible, matches,
-                             lambda c: MATCH_AFTER_MS if c.get("cwd") or prompts(c) else BARE_AFTER_MS))
+    claimed = pair_calls(roots, calls, "id", "created_at_ms", compatible, matches,
+                         lambda c: MATCH_AFTER_MS if c.get("cwd") or prompts(c) else BARE_AFTER_MS)
     grew = True
     while grew:
         grew = False
         for t in rows:
             if t["id"] not in claimed and parent_of(t["source"]) in claimed:
-                claimed.add(t["id"])
+                claimed[t["id"]] = claimed[parent_of(t["source"])]
                 grew = True
     return claimed
 
@@ -811,7 +820,7 @@ def scan(session_id, rows=None):
     now = time.time()
     rows = threads(QUOTA_LOOKBACK_MS) if rows is None else rows
     recent_rows = [t for t in rows if (t["updated_at_ms"] or 0) > now * 1000 - LOOKBACK_MS]
-    mine = ours(recent_rows, session_calls(session_id)) if recent_rows else set()
+    mine = ours(recent_rows, session_calls(session_id)) if recent_rows else {}
     agents, limits, limits_at = [], None, 0
     tails = {}
     for t in recent_rows:
@@ -852,6 +861,7 @@ def scan(session_id, rows=None):
             "startedAtMs": t["created_at_ms"] or 0,
             "updatedAtMs": int(active_at * 1000),
             "now": last_action(path),
+            "via": mine[t["id"]].get("via"),
         })
     budget = QUOTA_BYTES
     for path in quota_paths(rows, now):

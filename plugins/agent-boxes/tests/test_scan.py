@@ -174,15 +174,26 @@ class AttributionTests(Files):
                 "first_user_message": prompt}
 
     def test_one_call_one_run(self):
-        self.assertEqual(codex.ours([self.row()], [self.call('codex exec "task"')]), {"run"})
+        self.assertEqual(set(codex.ours([self.row()], [self.call('codex exec "task"')])), {"run"})
 
     def test_parallel_codex_calls(self):
         calls = [self.call('codex exec "task"', 100000), self.call('codex exec "task"', 101000)]
-        self.assertEqual(codex.ours([self.row("a", 102000), self.row("b", 103000)], calls), {"a", "b"})
+        self.assertEqual(set(codex.ours([self.row("a", 102000), self.row("b", 103000)], calls)), {"a", "b"})
 
     def test_ambiguous_calls_stay_unassigned(self):
-        self.assertEqual(codex.ours([self.row("a"), self.row("b")], [self.call('codex exec "task"')]), set())
-        self.assertEqual(codex.ours([self.row()], [self.call('codex exec "task"'), self.call('codex exec "task"')]), set())
+        self.assertEqual(set(codex.ours([self.row("a"), self.row("b")], [self.call('codex exec "task"')])), set())
+        self.assertEqual(set(codex.ours([self.row()], [self.call('codex exec "task"'), self.call('codex exec "task"')])), set())
+
+    def test_a_subagent_transcript_names_its_agent(self):
+        sub = os.path.join("projects", "p", "sess", "subagents", "agent-a1b2.jsonl")
+        self.assertEqual(codex.via(sub), "a1b2")
+        self.assertIsNone(codex.via(os.path.join("projects", "p", "sess.jsonl")))
+
+    def test_a_run_keeps_the_relay_that_launched_it(self):
+        call = {**self.call('codex exec "task"'), "via": "a1b2"}
+        self.assertEqual(codex.ours([self.row()], [call])["run"]["via"], "a1b2")
+        rows = boxes.agent_rows([{"id": "run", "parentId": None, "task": "t", "startedAtMs": 0, "via": "a1b2"}], 1000)
+        self.assertEqual(rows[0]["via"], "a1b2")
 
     def agy_row(self, key, at):
         return {"conversation_id": key, "inputAtMs": at, "parent_conversation_id": None,
@@ -221,7 +232,7 @@ class AttributionTests(Files):
         command = 'codex exec -m M -c k=v -s S --skip-git-repo-check -C "' + str(self.root) + '" -o out.txt - < brief.txt'
         call = self.call(command)
         self.assertEqual(call["brief"], "implement exec support")
-        self.assertEqual(codex.ours([self.row(prompt="implement exec support")], [call]), {"run"})
+        self.assertEqual(set(codex.ours([self.row(prompt="implement exec support")], [call])), {"run"})
 
     def test_brief_is_read_from_the_shell_cwd_not_codex_cd(self):
         sub = self.root / "rel"
@@ -296,7 +307,7 @@ class RolloutTests(Files):
         for path, at, used in ((own, now - 60, 10), (newer, now - 10, 30)):
             path.write_bytes(event("token_count", at, rate_limits={"primary": {"window_minutes": 300, "used_percent": used}}))
         row = self.thread(own, now)
-        with patch.object(codex, "session_calls", return_value=[]), patch.object(codex, "ours", return_value={"mine"}), \
+        with patch.object(codex, "session_calls", return_value=[]), patch.object(codex, "ours", return_value={"mine": {}}), \
                 patch.object(codex, "quota_paths", return_value=[str(own), str(newer)]):
             result = codex.scan("session", [row])
         self.assertEqual(result["limits"][0]["usedPercent"], 30)

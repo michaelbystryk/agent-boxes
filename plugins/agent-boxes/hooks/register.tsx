@@ -137,6 +137,12 @@ let claudeDir: string | undefined
 let homeDir: string | undefined
 // Whether the side bar's open-at-start was decided (fullscreen known).
 let isAutoOpenDecided = false
+
+// Relay subagents (a Claude harness around codex exec or agy -p) whose run a scan has found.
+let relayed = new Set<string>()
+
+// The pool a relay subagent's type runs on: codex-builder, agent-boxes:agy-flash and the like.
+const relayPool = (type: string) => (/codex/i.test(type) ? 'codex' : /agy|antigravity/i.test(type) ? 'agy' : undefined)
 // Bumped by register(), so work begun by an earlier load drops its result.
 let loadGen = 0
 
@@ -505,6 +511,7 @@ async function pollOnce($: EngineInterface) {
       return
     }
     const next = await scanNow($)
+    for (const a of [...(next?.codex.agents ?? []), ...(next?.agy.agents ?? [])]) if (a.via) relayed.add(a.via)
     if (next) await update($, scan, old => (JSON.stringify(old) === JSON.stringify(next) ? old : next))
     if (next) await refreshRouter($, lastGood ?? undefined)
   } catch (err) {
@@ -551,6 +558,7 @@ export const register: Register = (on, given) => {
   claudeDir = undefined
   homeDir = undefined
   isAutoOpenDecided = false
+  relayed = new Set()
   on('session.start', async ($, e, next) => {
     await loadConfig($)
     await $.command.register({ name: 'agent-boxes', description: 'Show the agent boxes side bar' })
@@ -708,19 +716,27 @@ export const register: Register = (on, given) => {
       </Box>
     )
 
-    const toolBody = (box: ToolBox | undefined) => (
+    // Relays show in their pool's box, not Claude's: their run with Claude's ✻ in front, and
+    // until the scan finds it (or once it has ended while the relay reports back), the relay itself.
+    const launched = new Set([...(s?.codex.agents ?? []), ...(s?.agy.agents ?? [])].map(a => a.via).filter(Boolean))
+    const relays = agents.filter(a => !a.isNested && relayPool(a.type))
+    const claudeOwn = agents.filter(a => !relays.includes(a))
+    const harness = <Text color={blend(CLAUDE, 0.5)}>✻ </Text>
+    const toolBody = (box: ToolBox | undefined, pool: 'codex' | 'agy') => {
+      const waiting = relays.filter(a => relayPool(a.type) === pool && !launched.has(a.id))
+      return (
       <Box flexDirection="column" backgroundColor={BG}>
         {box === undefined && <Text {...dim}>scanning…</Text>}
         {box?.error && <Text color="error">{box.error}</Text>}
         {box?.limits.slice(1).map(line => <Text {...dim}>{line}</Text>)}
         {box?.hint && <Text {...dim}>{box.hint}</Text>}
         {box?.stale && <Text color="#e3b341">{box.stale}</Text>}
-        {box !== undefined && box.agents.length === 0 && !box.error && <Text {...dim}>no agents running</Text>}
+        {box !== undefined && box.agents.length === 0 && waiting.length === 0 && !box.error && <Text {...dim}>no agents running</Text>}
         {box?.agents.map(a => (
           <Box flexDirection="column" backgroundColor={BG}>
             <Text color={FG}>
               {'  '.repeat(a.depth)}
-              {a.depth === 0 ? '◆ ' : '└ '}
+              {a.depth > 0 ? '└ ' : a.via ? harness : '◆ '}
               {a.text}
             </Text>
             {a.now && (
@@ -730,12 +746,19 @@ export const register: Register = (on, given) => {
             )}
           </Box>
         ))}
+        {waiting.map(a => (
+          <Text color={FG}>
+            {harness}
+            {a.label} <Text {...dim}>· {relayed.has(a.id) ? 'reporting back' : 'starting…'}</Text>
+          </Text>
+        ))}
       </Box>
-    )
+      )
+    }
 
     // A tool's card shows while scanning and once the scan finds the tool installed.
-    const tool = (key: string, icon: string, name: string, brand: Rgb[], box: ToolBox | undefined) =>
-      box?.installed === false ? null : card(key, title(icon, name, brand), brand, box?.fiveHour ?? undefined, box?.sevenDay ?? undefined, toolBody(box))
+    const tool = (key: 'codex' | 'agy', icon: string, name: string, brand: Rgb[], box: ToolBox | undefined) =>
+      box?.installed === false ? null : card(key, title(icon, name, brand), brand, box?.fiveHour ?? undefined, box?.sevenDay ?? undefined, toolBody(box, key))
 
     // Now: the task list's item in progress and the ones pending, else the summary of the turn,
     // else the first pending task; all done says so.
@@ -823,7 +846,7 @@ export const register: Register = (on, given) => {
           <Box flexDirection="column" backgroundColor={BG}>
             {c && <Text {...dim}>{c.model}</Text>}
             <Text {...dim}>ctx {pct(c?.context)}</Text>
-            {agents.map(a => (
+            {claudeOwn.map(a => (
               <Box flexDirection="column" backgroundColor={BG}>
                 <Text color={FG}>
                   {a.isNested ? '  └ ' : '◆ '}

@@ -1,5 +1,6 @@
 /** One agent of a tool's box; `now` is its latest action (a command, an edit, a reply). */
-export type AgentRow = { depth: number; text: string; now?: string | null }
+/** A scanned run; `via` is the Claude subagent that launched it (a relay), null for the chat itself. */
+export type AgentRow = { depth: number; text: string; now?: string | null; via?: string | null }
 
 /** One quota window as a number: % used (null when unknown) and when it resets, if known. */
 export type Window = { used: number | null; resetsAtMs?: number }

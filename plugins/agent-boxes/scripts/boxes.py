@@ -90,7 +90,7 @@ def agent_rows(agents, now):
     rows = []
 
     def walk(a, depth):
-        rows.append({"depth": depth, "text": agent_text(a, now), "now": a.get("now")})
+        rows.append({"depth": depth, "text": agent_text(a, now), "now": a.get("now"), "via": a.get("via")})
         for child in agents:
             if child["parentId"] == a["id"]:
                 walk(child, depth + 1)

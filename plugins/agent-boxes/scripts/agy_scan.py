@@ -148,6 +148,7 @@ def scan(session_id, rows=None):
             "effort": r.get("effort") or call.get("effort"),
             "steps": r["step_count"] or 0,
             "startedAtMs": int(call["atMs"]),
+            "via": call.get("via"),
         })
     agents += bench_scan.runs(session_id, "agy")
     agents.sort(key=lambda a: a["startedAtMs"])

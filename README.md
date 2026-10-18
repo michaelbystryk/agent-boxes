@@ -82,10 +82,10 @@ Codex and agy quota come from the side bar's own scan, so their pools count as u
 
 Each executor runs as a subagent type. Your own definition wins: `~/.claude/agents/<name>.md`, then the project's `.claude/agents/<name>.md`. Without one:
 
-- Codex and agy use this plugin's relays: `agent-boxes:codex-builder`, `codex-astra`, `agy-argon`, `agy-flash` and `agy-opus`. Each is a Haiku relay that writes the brief to a file, runs `codex exec` or `agy -p`, and reports back.
+- Codex and agy use this plugin's relays: `agent-boxes:codex-builder`, `codex-astra`, `agy-argon`, `agy-flash` and `agy-opus`. Each is a Haiku relay that writes the brief to a file, runs `codex exec` or `agy -p`, and reports back. A relay shows in the Codex or Antigravity box, not Claude's, with Claude's `✻` in front: first as `✻ <task> · starting…`, then as its run once the scan finds it.
 - Claude's `scout`, `worker` and `architect` become `general-purpose` on Haiku, Sonnet or Opus.
 
-The relays run `codex exec -s workspace-write` and `agy -p … --dangerously-skip-permissions`, or read-only / `--mode plan` for reviews and plans. Claude Code still asks you before each launch unless your permission rules allow it.
+The relays run `codex exec -s workspace-write` and `agy -p … --dangerously-skip-permissions`, or read-only / `--mode plan` for reviews and plans. Headless `--mode plan` lets agy open no files, so the relay pastes the files the brief names into the brief. Claude Code still asks you before each launch unless your permission rules allow it.
 
 ### Router options
 

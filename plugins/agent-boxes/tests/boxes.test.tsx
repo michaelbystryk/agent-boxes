@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import type { On, SessionMessage } from 'claude-code'
+import type { AgentInfo, On, SessionMessage } from 'claude-code'
 import type { Engine, MockClock } from 'claude-code/testing'
 
 const PANE = {
@@ -71,6 +71,8 @@ type Setup = {
   usage?: [number, number]
   // Whether the user has their own agent definitions (~/.claude/agents/<name>.md).
   hasAgentFiles?: boolean
+  // What agent.list answers; by default a running reviewer and a finished scout.
+  agents?: AgentInfo[]
 }
 
 type World = {
@@ -123,13 +125,16 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
       (unix(e.path) === taskDir && Object.keys(tasks).length > 0) ||
       folders.includes(unix(e.path)) ||
       (config !== undefined && unix(e.path) === configPath) ||
-      (setup.hasAgentFiles === true && /\/agents\/[\w-]+\.md$/.test(unix(e.path))),
+      (setup.hasAgentFiles === true && /\/agents\/[\w-]+\.md$/.test(unix(e.path))) ||
+      writes.has(unix(e.path)),
   }))
   on('fs.list', () => ({
     value: Object.keys(tasks).map(name => ({ name, kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
   }))
   on('fs.read', (_$, e) =>
-    unix(e.path) === configPath && config !== undefined
+    writes.has(unix(e.path))
+      ? { value: writes.get(unix(e.path))! }
+      : unix(e.path) === configPath && config !== undefined
       ? { value: typeof config === 'string' ? config : JSON.stringify(config) }
       : { value: JSON.stringify(tasks[unix(e.path).slice(taskDir.length + 1)]) },
   )
@@ -140,7 +145,7 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
   on('agent.list', () => {
     lists++
     return {
-    value: [
+    value: setup.agents ?? [
       { id: 'a1', description: 'Review the parser', type: 'reviewer', status: 'running' },
       { id: 'a2', description: 'Old search', type: 'scout', status: 'completed' },
     ],
@@ -229,6 +234,29 @@ test("the claude box lists the chat's headless bench runs", async ($, on) => {
   expect(await ui.find({ key: 'claude' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /◆ bench: T1_chest run 1/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /↳ \$ ls renders/ })).toBeDefined()
+  await ui.unmount()
+})
+
+// Two relays: Codex's run is under way, agy's has not shown up in the scan yet.
+const RELAYS: Setup = {
+  agents: [
+    { id: 'a1', description: 'Review the parser', type: 'reviewer', status: 'running' },
+    { id: 'r1', description: 'Codex smoke check', type: 'agent-boxes:codex-builder', status: 'running' },
+    { id: 'r2', description: 'Agy smoke check', type: 'agent-boxes:agy-flash', status: 'running' },
+  ],
+  scan: { ...SCAN, codex: { ...SCAN.codex, agents: [{ depth: 0, text: 'smoke check · gpt-6.1-sol high · 2k tok · 10s', via: 'r1' }] } },
+}
+
+test("a relay's run shows in its pool's box with Claude's mark, not in Claude's box", async ($, on) => {
+  await start($, on, RELAYS)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /✻ smoke check · gpt-6\.1-sol/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Codex smoke check/ })).toBeUndefined()
+  // agy's run isn't in the scan yet: the relay stands in for it
+  expect(await ui.find({ type: 'Text', text: /✻ Agy smoke check · starting…/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /no agents running/ })).toBeUndefined()
+  // Claude's own subagents stay in Claude's box
+  expect(await ui.find({ type: 'Text', text: /◆ Review the parser/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -375,6 +403,14 @@ test('advise mode never rewrites a spawn, and logs it', async ($, on) => {
   expect(w.toasts).toEqual([])
   const log = w.writes.get('/home/u/.claude/agent-boxes/router-history.jsonl') ?? ''
   expect(JSON.parse(log.trim()).agent).toBe('worker')
+})
+
+test('parallel spawns each get a history line', async ($, on) => {
+  const w = await start($, on, SHORT)
+  await submit($, SHADER)
+  await Promise.all([spawn($), spawn($), spawn($)])
+  const log = w.writes.get('/home/u/.claude/agent-boxes/router-history.jsonl') ?? ''
+  expect(log.trim().split('\n').length).toBe(3)
 })
 
 test('the router writes no route or quota files', async ($, on) => {

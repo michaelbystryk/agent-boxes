@@ -1,6 +1,6 @@
 {
   "name": "agent-boxes",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "A side bar for Claude Code (Claude, Codex and Antigravity usage, what each agent is doing, the current task and next step) and a router that picks the best model for each task from benchmarks and live quota",
   "author": { "name": "Michael Bystryk", "url": "https://github.com/michaelbystryk" },
   "homepage": "https://github.com/michaelbystryk/agent-boxes",
