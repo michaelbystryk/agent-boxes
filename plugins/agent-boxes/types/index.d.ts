@@ -4,7 +4,7 @@ export type AgentRow = { depth: number; text: string; now?: string | null }
 /** One quota window as a number: % used (null when unknown) and when it resets, if known. */
 export type Window = { used: number | null; resetsAtMs?: number }
 
-/** A provider's 5h and 7d windows, for agent-router; either may be missing. */
+/** A provider's 5h and 7d windows, for the router; either may be missing. */
 export type Windows = { '5h'?: Window | null; '7d'?: Window | null }
 
 /**
@@ -18,7 +18,7 @@ export type ToolBox = {
   fiveHour?: number | null
   sevenDay?: number | null
   windows?: Windows
-  /** agy only: each model group's windows ('gemini', 'claude/gpt'), for agent-router. */
+  /** agy only: each model group's windows ('gemini', 'claude/gpt'), for the router. */
   groups?: Record<string, Windows>
   hint?: string
   error?: string
@@ -46,8 +46,8 @@ export type SubAgent = { id: string; label: string; type: string; isNested: bool
 export type Brief = { task: string; steps: string[]; next: string; why?: string; isWaiting: boolean }
 
 /**
- * agent-router's state for this session, read from <claude dir>/agent-router/route-<session>.json:
- * its mode and best-placed pool from the session's start, and the last routed prompt's pick.
+ * The router box: the router's mode and best-placed pool from the session's start, and the last
+ * routed prompt's pick. Null when the router is off.
  */
 export type Route = {
   mode: string

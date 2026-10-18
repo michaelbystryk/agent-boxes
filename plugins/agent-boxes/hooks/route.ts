@@ -213,10 +213,10 @@ const how = (x: Executor) => `subagent_type "${x.agent}"${x.model ? `, model "${
 /** The hidden note attached to a user prompt. */
 export function contextNote(r: Route, quota: Quota, now: number) {
   if (!r.pick) {
-    return `[agent-router] Every pool is near its limit (${quotaLine(quota, now)}). Keep work small and tell the user.`
+    return `[router] Every pool is near its limit (${quotaLine(quota, now)}). Keep work small and tell the user.`
   }
   const lines = [
-    `[agent-router] This request looks like ${r.category.title} (${r.size}).`,
+    `[router] This request looks like ${r.category.title} (${r.size}).`,
     `Suggested executor: ${r.pick.label}, via ${how(r.pick)}. Why: ${r.why}.`,
   ]
   if (r.fallback) lines.push(`Fallback: ${r.fallback.label}, via ${how(r.fallback)}.`)
@@ -231,8 +231,8 @@ export function contextNote(r: Route, quota: Quota, now: number) {
 export function policy(executors: Executor[]) {
   const roster = executors.map(x => `- ${x.label}: ${how(x)} (${POOL_NAMES[x.pool]} quota)${x.note ? `; ${x.note}` : ''}`)
   return [
-    '# Model routing (agent-router)',
-    'Work is spread over three subscriptions: Claude, OpenAI Codex and Google Antigravity (agy). Each user prompt may carry an [agent-router] note naming the executor best suited to it, picked from benchmark fit and live quota.',
+    '# Model routing (agent-boxes router)',
+    'Work is spread over three subscriptions: Claude, OpenAI Codex and Google Antigravity (agy). Each user prompt may carry a [router] note naming the executor best suited to it, picked from benchmark fit and live quota.',
     'Rules:',
     '- Do quick, trivial steps yourself. Delegate substantive work to the suggested executor through the Agent tool.',
     '- If the user named a model or agent, use theirs and ignore the suggestion.',

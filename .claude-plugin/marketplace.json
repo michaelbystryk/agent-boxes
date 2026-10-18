@@ -1,6 +1,6 @@
 {
   "name": "agent-boxes",
-  "description": "Claude Code mods for running Claude, Codex and Antigravity together: a usage and agents side bar, and a router that picks the best model for each task",
+  "description": "A Claude Code plugin for running Claude, Codex and Antigravity together: a usage and agents side bar, and a router that picks the best model for each task",
   "owner": {
     "name": "Michael Bystryk",
     "url": "https://github.com/michaelbystryk"
@@ -9,12 +9,7 @@
     {
       "name": "agent-boxes",
       "source": "./plugins/agent-boxes",
-      "description": "A side bar for Claude Code: Claude, Codex and Antigravity usage meters, what each running agent is doing, the current task, and a recommended next step"
-    },
-    {
-      "name": "agent-router",
-      "source": "./plugins/agent-router",
-      "description": "Picks the best model for each task (Claude, Codex, Antigravity) from benchmarks and live 5h/7d quota, and tells Claude who to hand it to"
+      "description": "A side bar for Claude Code (Claude, Codex and Antigravity usage, what each agent is doing, the current task and next step) and a router that picks the best model for each task from benchmarks and live quota"
     }
   ]
 }

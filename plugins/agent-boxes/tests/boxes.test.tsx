@@ -67,8 +67,10 @@ type Setup = {
   messages?: SessionMessage[]
   // agent-boxes/config.json: an object is written as JSON, a string as is; absent by default.
   config?: object | string
-  // agent-router's route file for this session; absent by default.
-  route?: object
+  // Claude's 5h and 7d percent used.
+  usage?: [number, number]
+  // Whether the user has their own agent definitions (~/.claude/agents/<name>.md).
+  hasAgentFiles?: boolean
 }
 
 type World = {
@@ -80,6 +82,7 @@ type World = {
   lists: () => number
   logs: string[]
   writes: Map<string, string>
+  toasts: string[]
 }
 
 const TOOL_FOLDERS = ['/home/u/.codex', '/home/u/.gemini/antigravity-cli']
@@ -100,7 +103,8 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
   const taskDir = '/home/u/.claude/tasks/sess-1'
   const configPath = '/home/u/.claude/agent-boxes/config.json'
   const { config } = setup
-  const routePath = '/home/u/.claude/agent-router/route-sess-1.json'
+  const toasts: string[] = []
+  const [fiveHour, sevenDay] = setup.usage ?? [12, 30]
   on('session.id', () => ({ value: 'sess-1' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.usage', () => ({
@@ -108,8 +112,8 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
       startedAt: 0,
       context: { window: 200000, tokens: 82000, percent: 41 },
       rateLimits: [
-        { kind: 'five_hour', percentUsed: 12 },
-        { kind: 'seven_day', percentUsed: 30 },
+        { kind: 'five_hour', percentUsed: fiveHour },
+        { kind: 'seven_day', percentUsed: sevenDay },
       ],
     },
   }))
@@ -119,7 +123,7 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
       (unix(e.path) === taskDir && Object.keys(tasks).length > 0) ||
       folders.includes(unix(e.path)) ||
       (config !== undefined && unix(e.path) === configPath) ||
-      (setup.route !== undefined && unix(e.path) === routePath),
+      (setup.hasAgentFiles === true && /\/agents\/[\w-]+\.md$/.test(unix(e.path))),
   }))
   on('fs.list', () => ({
     value: Object.keys(tasks).map(name => ({ name, kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
@@ -127,8 +131,6 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
   on('fs.read', (_$, e) =>
     unix(e.path) === configPath && config !== undefined
       ? { value: typeof config === 'string' ? config : JSON.stringify(config) }
-      : unix(e.path) === routePath
-      ? { value: JSON.stringify(setup.route) }
       : { value: JSON.stringify(tasks[unix(e.path).slice(taskDir.length + 1)]) },
   )
   on('fs.write', (_$, e) => {
@@ -203,7 +205,13 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
   })
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('turn.complete', (_$, e) => ({ text: e.answer }))
-  on('prompt.submit', (_$, e) => ({ text: e.text }))
+  on('prompt.submit', (_$, e) => ({ text: e.text, context: e.context }))
+  on('prompt.compose', () => ({ sections: [] }))
+  on('agent.spawn', (_$, e) => ({ model: e.model ?? 'claude-sonnet-5-5', agentId: 'ag-1' }))
+  on('ui.toast', (_$, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
   on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
   on('ui.log', (_$, e) => {
     logs.push(e.text)
@@ -211,7 +219,7 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
   })
   await $.session.start({ cwd: '.', surface: 'terminal', isInteractive: true })
   await clock.settle()
-  return { argvs, clock, scans, checks, completes: () => completes, lists: () => lists, logs, writes }
+  return { argvs, clock, scans, checks, completes: () => completes, lists: () => lists, logs, writes, toasts }
 }
 
 test('each tool gets its own box with its agents', async ($, on) => {
@@ -248,42 +256,121 @@ test('each tool gets its own box with its agents', async ($, on) => {
   expect(run?.at(-1)).toBe('sess-1')
 })
 
-test("agent-router's box shows its mode and the best-placed pool before any prompt", async ($, on) => {
-  await start($, on, { route: { mode: 'advise', lead: 'agy best placed · 97% free · 8 ready', pick: '', atMs: 1 } })
+// The scan with Codex's and agy's windows, as the router reads them.
+const QUOTA_SCAN = {
+  ...SCAN,
+  codex: { ...SCAN.codex, windows: { '7d': { used: 18 } } },
+  agy: { ...SCAN.agy, groups: { gemini: { '7d': { used: 2 } }, 'claude/gpt': { '7d': { used: 0 } } } },
+}
+const SHADER = 'write a HLSL shader for the water edge glow'
+// Claude near its 5h limit, so the router's picks leave Claude.
+const SHORT: Setup = { scan: QUOTA_SCAN, usage: [93, 40] }
+
+async function submit($: Engine, text: string) {
+  const got = await $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
+  if ('drop' in got) throw new Error('dropped')
+  return got.context?.join('\n') ?? ''
+}
+
+const spawn = ($: Engine) =>
+  $.agent.spawn({
+    tool_use_id: 't1',
+    prompt: 'write the shader',
+    description: 'shader',
+    subagentType: 'worker',
+    provider: { plugin: 'engine', tier: 'core' },
+    parentModel: 'claude-opus-5-5',
+    background: false,
+    fork: false,
+  })
+
+test('the router box shows its mode and the best-placed pool before any prompt', async ($, on) => {
+  await start($, on, SHORT)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ key: 'router' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /· advise/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /agy best placed · 97% free/ })).toBeDefined()
+  // Claude is out at 93% 5h; agy's Claude group, from the scan, is untouched
+  expect(await ui.find({ type: 'Text', text: /^agy Claude best placed · 100% free · \d+ ready$/ })).toBeDefined()
   await ui.unmount()
 })
 
-test("agent-router's pick and fallback show in its box, not in next", async ($, on) => {
-  const route = { mode: 'steer', lead: '', category: 'bugfix', size: 'medium', pick: 'Gemini 4 Argon', fallback: 'Sonnet 5.5', why: 'best fit for hard bug fix', atMs: 1 }
-  await start($, on, { route })
+test('a user prompt gets a hidden route note, and the pick shows in the router box', async ($, on) => {
+  await start($, on, SHORT)
+  const note = await submit($, SHADER)
+  expect(note).toMatch(/\[router\].*shaders/)
+  // Claude's 5h is at 93%: Opus moves to agy's Claude group
+  expect(note).toMatch(/Opus 5.5 via agy/)
+  expect(note).toMatch(/Claude is near its limit/)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /Gemini 4 Argon/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /bugfix \(medium\)/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /best fit for hard bug fix · alt Sonnet 5\.5/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /⇄ Gemini/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /Opus 5\.5 via agy/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /shader \(medium\)/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /⇄ Opus/ })).toBeUndefined()
   await ui.unmount()
   // A short side bar puts it on one line.
   const short = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, scroll: { offset: 0, bodyRows: 20 } } })
-  expect(await short.find({ type: 'Text', text: /Gemini 4 Argon · bugfix · alt Sonnet 5\.5/ })).toBeDefined()
+  expect(await short.find({ type: 'Text', text: /Opus 5\.5 via agy · shader · alt / })).toBeDefined()
   await short.unmount()
 })
 
-test('no router box with agent-router off or not installed', async ($, on) => {
-  await start($, on, { route: { mode: 'off', lead: '', pick: '', atMs: 1 } })
+test('without agent files it routes to its own relays and general-purpose', async ($, on) => {
+  await start($, on, SHORT)
+  expect(await submit($, SHADER)).toMatch(/subagent_type "agent-boxes:agy-opus"/)
+  const compose = await $.prompt.compose({
+    model: 'claude-opus-5-5',
+    promptModel: 'claude-opus-5-5',
+    surfaces: ['terminal'],
+    tools: ['Agent', 'Bash'],
+    outputStyle: null,
+    traits: [],
+  })
+  const text = compose.sections.map(x => x.text).join('\n')
+  expect(text).toMatch(/Sonnet 5.5: subagent_type "general-purpose", model "sonnet"/)
+  expect(text).toMatch(/subagent_type "agent-boxes:codex-builder"/)
+})
+
+test("the user's own agent definitions win over the relays", async ($, on) => {
+  await start($, on, { ...SHORT, hasAgentFiles: true })
+  expect(await submit($, SHADER)).toMatch(/subagent_type "agy-opus"/)
+})
+
+test('a short reply gets no note and no model call', async ($, on) => {
+  const w = await start($, on, SHORT)
+  const before = w.completes()
+  expect(await submit($, 'yes go on')).toBe('')
+  expect(w.completes()).toBe(before)
+})
+
+test('router off: no note and no router box', async ($, on) => {
+  await start($, on, { ...SHORT, config: { router: 'off' } })
+  expect(await submit($, SHADER)).toBe('')
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ key: 'router' })).toBeUndefined()
   await ui.unmount()
 })
 
-test('no router box without agent-router', async ($, on) => {
-  await start($, on)
+test('steer mode moves a Claude spawn off Claude when it is out', async ($, on) => {
+  const w = await start($, on, { ...SHORT, hasAgentFiles: true, config: { router: { mode: 'steer' } } })
+  await submit($, SHADER)
+  expect((await spawn($)).agentId).toBe('ag-1')
+  expect(w.toasts[0]).toMatch(/worker → agy-opus/)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ key: 'router' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /· steer/ })).toBeDefined()
   await ui.unmount()
+})
+
+test('advise mode never rewrites a spawn, and logs it', async ($, on) => {
+  const w = await start($, on, SHORT)
+  await submit($, SHADER)
+  expect((await spawn($)).model).toBe('claude-sonnet-5-5')
+  expect(w.toasts).toEqual([])
+  const log = w.writes.get('/home/u/.claude/agent-boxes/router-history.jsonl') ?? ''
+  expect(JSON.parse(log.trim()).agent).toBe('worker')
+})
+
+test('the router writes no route or quota files', async ($, on) => {
+  const w = await start($, on, SHORT)
+  await submit($, SHADER)
+  expect([...w.writes.keys()].filter(p => /route-|quota\.json/.test(p))).toEqual([])
 })
 
 const HINT = {

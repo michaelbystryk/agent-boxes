@@ -1,5 +1,5 @@
-// Who can take a task, and who is best at what. Sources and dates are in RESEARCH.md;
-// the user's own config (<claude dir>/agent-router/config.json) reorders or disables any of it.
+// Who can take a task, and who is best at what. Sources and dates are in docs/routing-research.md;
+// the user's own config (the `router` key of <claude dir>/agent-boxes/config.json) reorders or disables any of it.
 
 /** Whose quota an executor spends: a subscription, or one of agy's model groups. */
 export type Pool = 'claude' | 'codex' | 'agy' | 'agy-claude'

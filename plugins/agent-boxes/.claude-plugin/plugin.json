@@ -1,11 +1,11 @@
 {
   "name": "agent-boxes",
-  "version": "0.3.1",
-  "description": "A side bar for Claude Code: Claude, Codex and Antigravity usage meters, what each running agent is doing, the current task, and a recommended next step",
+  "version": "0.4.0",
+  "description": "A side bar for Claude Code (Claude, Codex and Antigravity usage, what each agent is doing, the current task and next step) and a router that picks the best model for each task from benchmarks and live quota",
   "author": { "name": "Michael Bystryk", "url": "https://github.com/michaelbystryk" },
   "homepage": "https://github.com/michaelbystryk/agent-boxes",
   "repository": "https://github.com/michaelbystryk/agent-boxes",
   "license": "MIT",
-  "keywords": ["sidebar", "usage", "rate-limits", "codex", "antigravity", "agents", "tasks"],
+  "keywords": ["sidebar", "usage", "rate-limits", "codex", "antigravity", "agents", "tasks", "routing", "handoff"],
   "types": "./types/index.d.ts"
 }
