@@ -343,6 +343,16 @@ class UsageTests(Files):
         self.assertEqual(run.call_args[0][0], ["agy", "-p", "/usage", "--output-format", "json"])
         self.assertEqual(usage.read_cache()["groups"], {"gemini": {"5h": {"used": 50}}})
 
+    def test_windows_check_skips_agys_updater(self):
+        stamp = self.root / "last_check.timestamp"
+        stamp.write_bytes(b"")
+        os.utime(stamp, (0, 0))
+        done = type("Done", (), {"stdout": "{}"})()
+        for platform, moved in (("posix", False), ("nt", True)):
+            with patch.object(os, "name", platform), patch.object(usage, "UPDATE_STAMP", str(stamp)),                     patch.object(usage, "AGY", "agy"), patch.object(usage.subprocess, "run", return_value=done):
+                usage.usage_data()
+            self.assertEqual(stamp.stat().st_mtime > 0, moved, platform)
+
     def test_refresh_waits_for_agy_activity(self):
         now = time.time() * 1000
         recent = {"lastAttemptAtMs": now - 5 * 60000}

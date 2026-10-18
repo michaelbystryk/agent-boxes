@@ -27,6 +27,8 @@ TIMEOUT_S = 60
 AGY = shutil.which("agy") or (os.path.join(os.environ["LOCALAPPDATA"], "agy", "bin", "agy.exe")
                              if os.name == "nt" and os.environ.get("LOCALAPPDATA") else None)
 _LOCKS = {}
+# agy's auto-updater skips its check for 15 minutes after this file changes.
+UPDATE_STAMP = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-cli", "last_check.timestamp")
 
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -157,6 +159,14 @@ def parse(usage):
 
 def usage_data():
     """The `/usage` command's data from a print-mode agy, or None."""
+    if os.name == "nt":
+        # The updater agy starts runs `agy --version` in a console of its own, which Windows shows as
+        # a Terminal window, so this check marks the update check as just done; agy's own runs still
+        # check for updates.
+        try:
+            os.utime(UPDATE_STAMP)
+        except OSError:
+            pass
     r = subprocess.run(
         [AGY, "-p", "/usage", "--output-format", "json"],
         capture_output=True, text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
