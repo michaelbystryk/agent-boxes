@@ -10,7 +10,7 @@ A [Claude Code](https://claude.com/claude-code) plugin that decides who should t
    - When Claude is short, Opus and Sonnet places go to **Opus via agy**, the same model on Google's quota.
 3. **Tells Claude**, in a hidden note on the prompt (press ctrl+o to see it), for example: `Suggested executor: Gemini 4 Argon, via subagent_type "agent-router:agy-argon". Why: best fit for hard bug fix. Fallback: Sonnet 5.5…`. A fixed routing policy in the system prompt explains the roster and the rules: delegate substantive work, do quick steps yourself, a reviewer is never the builder, and a model you name yourself always wins.
 
-With [agent-boxes](../agent-boxes) (installed with it), the pick shows in the side bar's Next box as `⇄ Gemini 4 Argon · best fit for …`.
+With [agent-boxes](../agent-boxes) (installed with it), the side bar gets a `⇄ router` box with the mode in its title. Before any routed prompt, it shows the pool best placed right now (`agy best placed · 97% free · 8 ready`). After one, it shows the pick, the category, the reason and the fallback. It hides when `mode` is `off`, and drops to one line when the side bar is short.
 
 ## Install
 
@@ -62,7 +62,7 @@ agent-router leaves all of them alone and only suggests (or in `steer` mode sets
 
 ## Files
 
-- `~/.claude/agent-router/route-<session>.json`: the last pick, for the agent-boxes side bar.
+- `~/.claude/agent-router/route-<session>.json`: the mode, the best-placed pool and the last pick, for the agent-boxes side bar. Written at session start and on each prompt.
 - `~/.claude/agent-router/history.jsonl`: each spawn (category, the suggestion, what ran) and how long it took, capped at 1000 lines. Recorded for later tuning; v0.1 doesn't learn from it yet.
 - Reads `~/.claude/agent-boxes/quota.json`, which agent-boxes writes when Codex or agy quota changes. Readings older than 6 hours are ignored.
 

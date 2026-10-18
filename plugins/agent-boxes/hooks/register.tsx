@@ -14,6 +14,8 @@ const RETRY_MS = 60000
 const RETRY_MAX_MS = 30 * 60000
 // How often to look at the Codex and Antigravity folders again.
 const TOOLS_MS = 5 * 60000
+// Below this many rows, the router box shows its pick on one line.
+const SHORT_ROWS = 28
 
 const scan = atom({ plugin: 'agent-boxes', key: 'scan' } as const, null)
 const claude = atom({ plugin: 'agent-boxes', key: 'claude' } as const, null)
@@ -70,6 +72,7 @@ const GEMINI: Rgb[] = [[66, 133, 244], [155, 114, 203], [217, 101, 112]]
 // The Now and Next boxes: blue for what is under way, violet for what is recommended after.
 const NOW: Rgb[] = [[56, 139, 253], [121, 192, 255]]
 const NEXT: Rgb[] = [[163, 113, 247], [210, 168, 255]]
+const ROUTER: Rgb[] = [[45, 186, 160], [125, 226, 200]]
 
 function blend(stops: Rgb[], f: number) {
   const t = Math.min(1, Math.max(0, f)) * (stops.length - 1)
@@ -204,8 +207,8 @@ async function readTasks($: EngineInterface) {
   await update($, tasks, old => (JSON.stringify(old) === JSON.stringify(next) ? old : next))
 }
 
-// agent-router's pick for the latest prompt, when that plugin is installed: it writes
-// <claude dir>/agent-router/route-<session id>.json on each prompt.
+// agent-router's state, when that plugin is installed: it writes
+// <claude dir>/agent-router/route-<session id>.json at session start and on each prompt.
 async function readRoute($: EngineInterface) {
   await folders($)
   const path = `${claudeDir}/agent-router/route-${await $.session.id()}.json`
@@ -213,11 +216,18 @@ async function readRoute($: EngineInterface) {
   try {
     if (await $.fs.exists(path)) {
       const r = JSON.parse(await $.fs.read(path)) as Record<string, unknown>
-      if (typeof r.pick === 'string' && r.pick) {
+      const text = (v: unknown) => (typeof v === 'string' ? v : '')
+      // A file from before 0.2 has a pick but no mode.
+      const mode = text(r.mode) || (text(r.pick) ? 'advise' : '')
+      if (mode && mode !== 'off') {
         next = {
-          category: String(r.category ?? ''),
-          pick: r.pick,
-          why: typeof r.why === 'string' ? r.why : '',
+          mode,
+          lead: text(r.lead),
+          category: text(r.category),
+          size: text(r.size),
+          pick: text(r.pick),
+          fallback: text(r.fallback),
+          why: text(r.why),
           atMs: typeof r.atMs === 'number' ? r.atMs : 0,
         }
       }
@@ -773,20 +783,46 @@ export const register: Register = (on, given) => {
       </Box>,
     )
 
-    const nextBox = config.brief || r
+    const nextBox = config.brief
       ? plain(
           'next',
           title('➜', 'next', NEXT),
           blend(NEXT, 0),
           <Box flexDirection="column" backgroundColor={BG}>
-            {config.brief && (b?.next ? <Text color={FG}>{b.next}</Text> : <Text {...dim}>after the next turn</Text>)}
-            {config.brief && b?.why && <Text {...dim}>{b.why}</Text>}
-            {r && (
-              <Text color={FG}>
-                ⇄ {r.pick} <Text {...dim}>· {r.why || r.category}</Text>
-              </Text>
-            )}
+            {b?.next ? <Text color={FG}>{b.next}</Text> : <Text {...dim}>after the next turn</Text>}
+            {b?.why && <Text {...dim}>{b.why}</Text>}
           </Box>,
+        )
+      : null
+
+    // agent-router: its mode in the title; the last pick and fallback, or before any routed
+    // prompt the pool best placed now. One line when the side bar is short.
+    const routed = (x: Route) => (x.size ? `${x.category} (${x.size})` : x.category)
+    const routerBox = r
+      ? plain(
+          'router',
+          <Text>
+            {title('⇄', 'router', ROUTER)}
+            <Text {...dim}> · {r.mode}</Text>
+          </Text>,
+          blend(ROUTER, 0),
+          !r.pick ? (
+            <Text {...dim}>{r.lead || 'waiting for the first prompt'}</Text>
+          ) : e.props.scroll.bodyRows < SHORT_ROWS ? (
+            <Text color={FG}>
+              {r.pick} <Text {...dim}>· {r.category}{r.fallback ? ` · alt ${r.fallback}` : ''}</Text>
+            </Text>
+          ) : (
+            <Box flexDirection="column" backgroundColor={BG}>
+              <Text color={FG}>
+                {r.pick} <Text {...dim}>· {routed(r)}</Text>
+              </Text>
+              <Text {...dim}>
+                {r.why}
+                {r.fallback ? ` · alt ${r.fallback}` : ''}
+              </Text>
+            </Box>
+          ),
         )
       : null
 
@@ -820,6 +856,7 @@ export const register: Register = (on, given) => {
         {tool('agy', '✦', 'antigravity', GEMINI, s?.agy)}
         {nowBox}
         {nextBox}
+        {routerBox}
       </Box>
     )
   })

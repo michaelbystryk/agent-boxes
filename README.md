@@ -9,7 +9,7 @@ A side bar for [Claude Code](https://claude.com/claude-code) that shows, at a gl
 
 ![agent-boxes: three example side bars, each with Claude, Codex, Antigravity, Now and Next boxes](docs/hero.png)
 
-This repository is also the marketplace for **[agent-router](plugins/agent-router)**. It picks the best model for each task across Claude, Codex and Antigravity from benchmarks and live quota, and its pick shows in the Next box as `⇄ <model> · <why>`.
+This repository is also the marketplace for **[agent-router](plugins/agent-router)**. It picks the best model for each task across Claude, Codex and Antigravity from benchmarks and live quota, and it gets its own `⇄ router` box at the bottom of the side bar: its mode, then the pool best placed for the next task, or after a routed prompt the pick, the reason and a fallback.
 
 Each box's border goes green, then yellow at 60% of its 7-day window, then red at 85%. The meters are gradients in each company's colours. These are simulated examples; the side bar is 48 columns wide by default. Full size: [crunch](docs/crunch.png) · [steady](docs/steady.png) · [light](docs/light.png).
 

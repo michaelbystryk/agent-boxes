@@ -168,6 +168,24 @@ export function route(
   return { category, size, pick, fallback, scored, why, isClaudeLow: stateOf('claude').isOut }
 }
 
+/**
+ * The pool best placed for the next task, for the side bar's idle line: `agy best placed · 97% free · 8 ready`.
+ * Only pools with an executor in the roster and a quota reading count.
+ */
+export function leadLine(quota: Quota, now: number, executors: Executor[]) {
+  let best: { pool: Pool; s: PoolState } | undefined
+  for (const pool of new Set(executors.map(x => x.pool))) {
+    if (!quota[pool]) continue
+    const s = poolState(pool, quota[pool], now)
+    if (s.isOut) continue
+    if (!best || s.headroom * (1 + s.bonus) > best.s.headroom * (1 + best.s.bonus)) best = { pool, s }
+  }
+  const ready = `${executors.length} ready`
+  if (!best) return `quota unknown · ${ready}`
+  const lose = best.s.bonus > 0 ? ' · use it or lose it' : ''
+  return `${POOL_NAMES[best.pool]} best placed · ${Math.round(best.s.headroom * 100)}% free${lose} · ${ready}`
+}
+
 const pct = (v: number | null | undefined) => (typeof v === 'number' ? `${Math.round(v)}%` : '–')
 
 function resetIn(ms: number | undefined, now: number) {

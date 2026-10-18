@@ -1,6 +1,6 @@
 {
   "name": "agent-router",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Picks the best model for each task (Claude, Codex, Antigravity) from benchmarks and live 5h/7d quota, and tells Claude who to hand it to",
   "author": { "name": "Michael Bystryk", "url": "https://github.com/michaelbystryk" },
   "homepage": "https://github.com/michaelbystryk/agent-boxes",

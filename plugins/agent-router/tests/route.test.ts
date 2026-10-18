@@ -170,6 +170,16 @@ test('without agent files it routes to its own relays and general-purpose', asyn
   expect(text).toMatch(/subagent_type "agent-router:codex-builder"/)
 })
 
+test('the side bar state is written from session start, before any prompt', async ($, on) => {
+  const { writes } = await start($, on, undefined, SCAN)
+  const file = [...writes].find(([path]) => path.endsWith('/agent-router/route-sess-1.json'))?.[1]
+  const state = JSON.parse(file ?? '{}')
+  expect(state.mode).toBe('advise')
+  expect(state.pick).toBe('')
+  // Claude is out at 93% 5h; agy's Claude group is untouched
+  expect(state.lead).toMatch(/^agy Claude best placed · 100% free · \d+ ready$/)
+})
+
 test('a short reply gets no note and no model call', async ($, on) => {
   const w = await start($, on, undefined, SCAN)
   const got = await $.prompt.submit({ text: 'yes go on', wait: false, origin: { kind: 'composer' } })

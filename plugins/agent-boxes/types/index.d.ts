@@ -45,8 +45,20 @@ export type SubAgent = { id: string; label: string; type: string; isNested: bool
 /** The small model's read of the session after the last turn: the task, its steps, what to do next. */
 export type Brief = { task: string; steps: string[]; next: string; why?: string; isWaiting: boolean }
 
-/** agent-router's pick for the latest prompt, read from <claude dir>/agent-router/route-<session>.json. */
-export type Route = { category: string; pick: string; why: string; atMs: number }
+/**
+ * agent-router's state for this session, read from <claude dir>/agent-router/route-<session>.json:
+ * its mode and best-placed pool from the session's start, and the last routed prompt's pick.
+ */
+export type Route = {
+  mode: string
+  lead: string
+  category: string
+  size: string
+  pick: string
+  fallback: string
+  why: string
+  atMs: number
+}
 
 declare module 'claude-code' {
   interface PluginState {

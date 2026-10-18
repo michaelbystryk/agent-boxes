@@ -248,33 +248,41 @@ test('each tool gets its own box with its agents', async ($, on) => {
   expect(run?.at(-1)).toBe('sess-1')
 })
 
-test("agent-router's pick shows in the next box", async ($, on) => {
-  await start($, on, { route: { category: 'blender', pick: 'agy-argon', why: 'Claude 5h 82%', atMs: 1 } })
+test("agent-router's box shows its mode and the best-placed pool before any prompt", async ($, on) => {
+  await start($, on, { route: { mode: 'advise', lead: 'agy best placed · 97% free · 8 ready', pick: '', atMs: 1 } })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /⇄ agy-argon/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /Claude 5h 82%/ })).toBeDefined()
+  expect(await ui.find({ key: 'router' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /· advise/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /agy best placed · 97% free/ })).toBeDefined()
   await ui.unmount()
 })
 
-test('the scan shares Codex and agy windows with agent-router', async ($, on) => {
-  const scan = {
-    codex: { ...SCAN.codex, windows: { '5h': { used: 3 }, '7d': { used: 35, resetsAtMs: 9 } } },
-    agy: { ...SCAN.agy, groups: { gemini: { '5h': { used: 0 }, '7d': null }, 'claude/gpt': { '5h': { used: 10 } } } },
-  }
-  const { writes } = await start($, on, { scan })
+test("agent-router's pick and fallback show in its box, not in next", async ($, on) => {
+  const route = { mode: 'steer', lead: '', category: 'bugfix', size: 'medium', pick: 'Gemini 4 Argon', fallback: 'Sonnet 5.5', why: 'best fit for hard bug fix', atMs: 1 }
+  await start($, on, { route })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  const file = writes.get('/home/u/.claude/agent-boxes/quota.json')
+  expect(await ui.find({ type: 'Text', text: /Gemini 4 Argon/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /bugfix \(medium\)/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /best fit for hard bug fix · alt Sonnet 5\.5/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /⇄ Gemini/ })).toBeUndefined()
   await ui.unmount()
-  const shared = JSON.parse(file ?? '{}')
-  expect(shared.codex['7d']).toEqual({ used: 35, resetsAtMs: 9 })
-  expect(shared.agy['claude/gpt']['5h'].used).toBe(10)
-  expect(typeof shared.atMs).toBe('number')
+  // A short side bar puts it on one line.
+  const short = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, scroll: { offset: 0, bodyRows: 20 } } })
+  expect(await short.find({ type: 'Text', text: /Gemini 4 Argon · bugfix · alt Sonnet 5\.5/ })).toBeDefined()
+  await short.unmount()
 })
 
-test('no route line without agent-router', async ($, on) => {
+test('no router box with agent-router off or not installed', async ($, on) => {
+  await start($, on, { route: { mode: 'off', lead: '', pick: '', atMs: 1 } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ key: 'router' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('no router box without agent-router', async ($, on) => {
   await start($, on)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /⇄/ })).toBeUndefined()
+  expect(await ui.find({ key: 'router' })).toBeUndefined()
   await ui.unmount()
 })
 

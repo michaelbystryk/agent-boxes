@@ -6,6 +6,7 @@ import {
   DEFAULTS,
   categoryById,
   classify,
+  leadLine,
   contextNote,
   policy,
   quotaLine,
@@ -137,13 +138,25 @@ async function categorize($: EngineInterface, text: string): Promise<Category | 
   }
 }
 
-async function writeRoute($: EngineInterface, r: Route | undefined) {
+// The side bar's state for this session: the mode and best-placed pool from the start,
+// then the last routed prompt's pick. agent-boxes draws it as the router box.
+async function writeState($: EngineInterface) {
   await folders($)
   const path = `${dir()}/route-${await $.session.id()}.json`
-  const body = r?.pick
-    ? { category: r.category.id, pick: r.pick.label, why: r.why, atMs: await $.clock.now() }
-    : { category: '', pick: '', why: '', atMs: await $.clock.now() }
-  await $.fs.write(path, JSON.stringify(body))
+  const now = await $.clock.now()
+  const list = executors()
+  const r = last?.route
+  const body = {
+    mode: config.mode,
+    lead: config.mode === 'off' ? '' : leadLine(await quota($), now, list),
+    category: r?.category.id ?? '',
+    size: r?.size ?? '',
+    pick: r?.pick?.label ?? '',
+    fallback: r?.fallback?.label ?? '',
+    why: r?.why ?? '',
+    atMs: now,
+  }
+  await $.fs.write(path, JSON.stringify(body)).catch(() => undefined)
 }
 
 async function log($: EngineInterface, entry: object) {
@@ -203,6 +216,7 @@ export const register: Register = on => {
     await loadConfig($)
     await findAgents($)
     await $.command.register({ name: 'route', description: 'Show which model agent-router picks and why' })
+    await writeState($)
 
     return next(e)
   })
@@ -220,6 +234,7 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     const isUsers = e.origin.kind === 'composer' || e.origin.kind === 'bridge'
     if (config.mode === 'off' || e.isMeta || e.command || !isUsers || !e.text.trim()) return next(e)
+    // Every prompt refreshes the side bar's best-placed line; a routed one also sets the pick.
     let note: string | undefined
     try {
       const category = await categorize($, e.text)
@@ -229,8 +244,8 @@ export const register: Register = on => {
         const r = route(category, sizeOf(e.text), q, now, executors(), config)
         last = { route: r, quota: q, atMs: now }
         note = contextNote(r, q, now)
-        await writeRoute($, r)
       }
+      await writeState($)
     } catch (err) {
       $.ui.log(`agent-router: ${String(err)}`)
     }
@@ -289,6 +304,7 @@ export const register: Register = on => {
   on('command.run', { command: 'route' }, async $ => {
     await loadConfig($)
     await findAgents($)
+    await writeState($)
 
     return { text: await report($) }
   })
