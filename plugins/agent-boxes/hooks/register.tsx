@@ -836,6 +836,13 @@ export const register: Register = (on, given) => {
                 )}
               </Box>
             ))}
+            {/* headless `claude -p` runs this chat started (llm-blender-bench's bench.py), from boxes.py */}
+            {s?.claude?.agents.map(a => (
+              <Box flexDirection="column" backgroundColor={BG}>
+                <Text color={FG}>◆ {a.text}</Text>
+                {a.now && <Text {...dim}>  ↳ {a.now}</Text>}
+              </Box>
+            ))}
           </Box>,
         )}
         {tool('codex', '֎', 'codex', OPENAI, s?.codex)}

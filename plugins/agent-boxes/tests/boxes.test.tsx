@@ -222,6 +222,16 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
   return { argvs, clock, scans, checks, completes: () => completes, lists: () => lists, logs, writes, toasts }
 }
 
+test("the claude box lists the chat's headless bench runs", async ($, on) => {
+  const bench = { depth: 0, text: 'bench: T1_chest run 1 · claude-opus-5-5 · 52 tools · 25m', now: '$ ls renders' }
+  await start($, on, { scan: { ...SCAN, claude: { agents: [bench] } } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ key: 'claude' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /◆ bench: T1_chest run 1/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /↳ \$ ls renders/ })).toBeDefined()
+  await ui.unmount()
+})
+
 test('each tool gets its own box with its agents', async ($, on) => {
   const { argvs, scans } = await start($, on)
 

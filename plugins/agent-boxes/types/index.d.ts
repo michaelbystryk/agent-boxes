@@ -29,7 +29,8 @@ export type ToolBox = {
 /** One item of this session's task list (<claude dir>/tasks/<session>/). */
 export type Task = { id: string; subject: string; activeForm?: string | null; status: 'pending' | 'in_progress' | 'completed' }
 
-export type Scan = { codex: ToolBox; agy: ToolBox; atMs?: number }
+/** `claude` holds headless `claude -p` runs this chat started through bench.py; subagents come from the engine. */
+export type Scan = { codex: ToolBox; agy: ToolBox; claude?: { agents: AgentRow[]; error?: string }; atMs?: number }
 
 export type ClaudeBox = {
   model: string
