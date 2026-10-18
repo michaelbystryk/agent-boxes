@@ -157,7 +157,7 @@ def agy_box(session_id, rows=None, prepare=False):
         "fiveHour": window_used(window(gemini, "5h"), now),
         "sevenDay": window_used(window(gemini, "7d"), now),
         "windows": {"5h": window_raw(window(gemini, "5h"), now), "7d": window_raw(window(gemini, "7d"), now)},
-        # every model group's windows (agy also runs Claude and GPT-OSS on its own quota), for agent-router
+        # every model group's windows (agy also runs Claude and GPT-OSS on its own quota), for the router
         "groups": {name: {"5h": window_raw(window(g, "5h"), now), "7d": window_raw(window(g, "7d"), now)}
                    for name, g in groups.items()},
     }
