@@ -137,7 +137,7 @@ def runs(session_id, agent):
             continue
         row = {
             "id": d,
-            "task": f"{c['task']} run {os.path.basename(d)}",
+            "task": f"{c['task']} {'control run' if c.get('control') else 'run'} {os.path.basename(d)}",
             "parentId": None,
             "nickname": "bench",
             "model": model_of(c["repo"], agent),

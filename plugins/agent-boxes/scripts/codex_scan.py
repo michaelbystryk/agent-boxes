@@ -42,7 +42,7 @@ STATE = os.path.join(CLAUDE_HOME, "agent-boxes")
 _TRANSCRIPTS = {}
 _COMMANDS = {}
 _READ_BUDGET = None
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 TRANSCRIPT_BYTES = 64 * 1024 * 1024
 TRANSCRIPT_SECONDS = 2
 RECORD_BYTES = 4 * 1024 * 1024
@@ -619,8 +619,9 @@ def parsed_calls(at_ms, command, cwd=None):
                 cwd = resolve_path(expand(args[0], env), cwd)
         elif name in ("python", "python3", "py"):
             # llm-blender-bench: `python tools/bench.py run <agent> <task>` starts that agent's CLI
-            # headless, working in <repo>/benches/<agent>/<task>
+            # headless, working in <repo>/benches/<agent>/<task> (<task>_noguide for --no-guide control runs)
             args = [w for w in words[1:] if not w.startswith("-")]
+            control = "--no-guide" in words
             if (len(args) >= 4 and re.split(r"[\\/]", args[0])[-1] == "bench.py" and args[1] == "run"
                     and args[2] in ("claude", "codex", "agy")):
                 script = resolve_path(expand(args[0], env), cwd)
@@ -628,7 +629,8 @@ def parsed_calls(at_ms, command, cwd=None):
                     paths = ntpath if os.name == "nt" else posixpath
                     repo = paths.dirname(paths.dirname(script))
                     out.append({"atMs": at_ms, "kind": "bench", "agent": args[2], "task": args[3], "repo": repo,
-                                "cwd": paths.join(repo, "benches", args[2], args[3])})
+                                "control": control,
+                                "cwd": paths.join(repo, "benches", args[2], args[3] + ("_noguide" if control else ""))})
         elif name in ("codex", "agy"):
             call = {"atMs": at_ms, "kind": name,
                     "cwd": host_path(expand(cwd, env)) if cwd else None}

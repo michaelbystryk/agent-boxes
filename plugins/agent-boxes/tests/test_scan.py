@@ -464,6 +464,11 @@ class BenchTests(Files):
         self.assertEqual(codex.parsed_calls(1000, "python tools/bench.py review T1_chest", str(self.repo)), [])
         self.assertEqual(codex.parsed_calls(1000, "python tools/bench.py run gemini T1_chest", str(self.repo)), [])
 
+    def test_no_guide_launch_uses_the_control_dir(self):
+        [call] = codex.parsed_calls(1000, "python tools/bench.py run claude T2 --no-guide", str(self.repo))
+        self.assertTrue(call["control"])
+        self.assertEqual(codex.norm_path(call["cwd"]), codex.norm_path(str(self.repo / "benches" / "claude" / "T2_noguide")))
+
     def test_codex_launch_is_a_codex_call(self):
         calls = self.launch("codex", 1000)
         with patch.object(codex, "session_commands", lambda _: calls):
