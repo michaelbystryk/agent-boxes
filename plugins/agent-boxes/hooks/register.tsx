@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, PluginOptions, Register, RenderChildren, SessionRateLimit } from 'claude-code'
 
-import type { Brief, ClaudeBox, Scan, SubAgent, Task, ToolBox } from '../types'
+import type { Brief, ClaudeBox, Route, Scan, SubAgent, Task, ToolBox, Window } from '../types'
 
 const POLL_MS = 5000
 const PANE = 'agent-boxes'
@@ -20,6 +20,7 @@ const claude = atom({ plugin: 'agent-boxes', key: 'claude' } as const, null)
 const subagents = atom({ plugin: 'agent-boxes', key: 'subagents' } as const, [])
 const brief = atom({ plugin: 'agent-boxes', key: 'brief' } as const, null)
 const tasks = atom({ plugin: 'agent-boxes', key: 'tasks' } as const, [])
+const route = atom({ plugin: 'agent-boxes', key: 'route' } as const, null)
 
 // The options: the defaults below, changed by `<claude dir>/agent-boxes/config.json`, read once per
 // session. plugin.json declares no userConfig, because Claude Code asks for every option that has no
@@ -82,6 +83,14 @@ function blend(stops: Rgb[], f: number) {
 
 const windowOf = (limits: SessionRateLimit[], kind: string) =>
   limits.find(w => w.kind === kind)?.percentUsed
+
+// The window with its reset time, for agent-router.
+function rawWindow(limits: SessionRateLimit[], kind: string): Window | null {
+  const w = limits.find(l => l.kind === kind)
+  if (!w) return null
+  const at = w.resetsAt ? Date.parse(w.resetsAt) : NaN
+  return Number.isFinite(at) ? { used: w.percentUsed, resetsAtMs: at } : { used: w.percentUsed }
+}
 
 // Module state; register() resets all of it, so a reload starts clean.
 let isScanning = false
@@ -195,6 +204,30 @@ async function readTasks($: EngineInterface) {
   await update($, tasks, old => (JSON.stringify(old) === JSON.stringify(next) ? old : next))
 }
 
+// agent-router's pick for the latest prompt, when that plugin is installed: it writes
+// <claude dir>/agent-router/route-<session id>.json on each prompt.
+async function readRoute($: EngineInterface) {
+  await folders($)
+  const path = `${claudeDir}/agent-router/route-${await $.session.id()}.json`
+  let next: Route | null = null
+  try {
+    if (await $.fs.exists(path)) {
+      const r = JSON.parse(await $.fs.read(path)) as Record<string, unknown>
+      if (typeof r.pick === 'string' && r.pick) {
+        next = {
+          category: String(r.category ?? ''),
+          pick: r.pick,
+          why: typeof r.why === 'string' ? r.why : '',
+          atMs: typeof r.atMs === 'number' ? r.atMs : 0,
+        }
+      }
+    }
+  } catch {
+    // mid-write; the next poll reads it
+  }
+  await update($, route, old => (JSON.stringify(old) === JSON.stringify(next) ? old : next))
+}
+
 // Runs the summary for the turn `gen`, then once more for a turn that ended while it ran.
 // A prompt submitted meanwhile cancels the queued one (prompt.submit clears queuedGen).
 async function briefing($: EngineInterface, gen: number) {
@@ -283,6 +316,7 @@ async function forget($: EngineInterface) {
   queuedGen = undefined
   await update($, brief, () => null)
   await update($, tasks, () => [])
+  await update($, route, () => null)
 }
 
 async function measure($: EngineInterface, rateLimits?: SessionRateLimit[]) {
@@ -294,6 +328,7 @@ async function measure($: EngineInterface, rateLimits?: SessionRateLimit[]) {
       context: usage.context.percent,
       fiveHour: windowOf(limits, 'five_hour'),
       sevenDay: windowOf(limits, 'seven_day'),
+      windows: { '5h': rawWindow(limits, 'five_hour'), '7d': rawWindow(limits, 'seven_day') },
     }
     await update($, claude, old => (JSON.stringify(old) === JSON.stringify(next) ? old : next))
   } catch (err) {
@@ -463,11 +498,28 @@ async function scanNow($: EngineInterface): Promise<Scan | undefined> {
   return got
 }
 
+// Codex's and agy's windows for agent-router, in <claude dir>/agent-boxes/quota.json; written
+// only when they change. Quota is the account's, so every session shares the one file.
+let sharedQuota = ''
+async function shareQuota($: EngineInterface, s: Scan) {
+  if (s.codex.stale || s.agy.stale) return
+  const body = JSON.stringify({
+    codex: s.codex.installed === false ? null : s.codex.windows ?? null,
+    agy: s.agy.installed === false ? null : s.agy.groups ?? (s.agy.windows ? { gemini: s.agy.windows } : null),
+  })
+  if (body === sharedQuota) return
+  sharedQuota = body
+  await folders($)
+  const at = await $.clock.now()
+  await $.fs.write(`${claudeDir}/agent-boxes/quota.json`, `${body.slice(0, -1)},"atMs":${at}}`).catch(() => undefined)
+}
+
 const isPlaced = async ($: EngineInterface) => (await $.ui.panes()).some(p => p.id === PANE && p.isPlaced)
 
 async function pollOnce($: EngineInterface) {
   try {
     await readTasks($)
+    await readRoute($)
     await watchAgents($)
     // No scan while the pane waits undrawn; its first render asks for one.
     if (!(await isPlaced($))) {
@@ -481,6 +533,7 @@ async function pollOnce($: EngineInterface) {
     }
     const next = await scanNow($)
     if (next) await update($, scan, old => (JSON.stringify(old) === JSON.stringify(next) ? old : next))
+    if (next) await shareQuota($, next)
   } catch (err) {
     $.ui.log(`agent-boxes: ${String(err)}`)
   }
@@ -525,6 +578,7 @@ export const register: Register = (on, given) => {
   claudeDir = undefined
   homeDir = undefined
   isAutoOpenDecided = false
+  sharedQuota = ''
 
   on('session.start', async ($, e, next) => {
     await loadConfig($)
@@ -595,6 +649,7 @@ export const register: Register = (on, given) => {
     const agents = await read($, subagents)
     const b = await read($, brief)
     const list = await read($, tasks)
+    const r = await read($, route)
     const BG = config.background === 'black' ? 'black' : undefined
     // On black, explicit light text so light themes stay readable; dock keeps the theme's.
     const FG = BG ? '#e6e6e6' : undefined
@@ -718,14 +773,19 @@ export const register: Register = (on, given) => {
       </Box>,
     )
 
-    const nextBox = config.brief
+    const nextBox = config.brief || r
       ? plain(
           'next',
           title('➜', 'next', NEXT),
           blend(NEXT, 0),
           <Box flexDirection="column" backgroundColor={BG}>
-            {b?.next ? <Text color={FG}>{b.next}</Text> : <Text {...dim}>after the next turn</Text>}
-            {b?.why && <Text {...dim}>{b.why}</Text>}
+            {config.brief && (b?.next ? <Text color={FG}>{b.next}</Text> : <Text {...dim}>after the next turn</Text>)}
+            {config.brief && b?.why && <Text {...dim}>{b.why}</Text>}
+            {r && (
+              <Text color={FG}>
+                ⇄ {r.pick} <Text {...dim}>· {r.why || r.category}</Text>
+              </Text>
+            )}
           </Box>,
         )
       : null

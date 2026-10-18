@@ -9,6 +9,8 @@ A side bar for [Claude Code](https://claude.com/claude-code) that shows, at a gl
 
 ![agent-boxes: three example side bars, each with Claude, Codex, Antigravity, Now and Next boxes](docs/hero.png)
 
+This repository is also the marketplace for **[agent-router](plugins/agent-router)**. It picks the best model for each task across Claude, Codex and Antigravity from benchmarks and live quota, and its pick shows in the Next box as `⇄ <model> · <why>`.
+
 Each box's border goes green, then yellow at 60% of its 7-day window, then red at 85%. The meters are gradients in each company's colours. These are simulated examples; the side bar is 48 columns wide by default. Full size: [crunch](docs/crunch.png) · [steady](docs/steady.png) · [light](docs/light.png).
 
 ## Install
@@ -78,21 +80,23 @@ Everything runs on your own machine. Nothing is sent anywhere except the summary
 - **Codex runs don't show up:** only runs this chat started with `codex exec` are listed, and only for 12 hours after they start.
 - **Antigravity quota shows `–`:** `agy` must be on `PATH` (on Windows, the default `%LOCALAPPDATA%gyingy.exe` also works) and signed in. The first reading takes a few seconds.
 - **`scan slow` hint:** the 5-second background scan took longer than usual (for example, while reading large session logs or waiting on disk). It keeps the previous reading and catches up on the next poll.
-- **State and cache files:** stored in `~/.claude/agent-boxes/` (or `$CLAUDE_CONFIG_DIR/agent-boxes/`). Delete that folder to clear cached Antigravity quota readings.
+- **State and cache files:** stored in `~/.claude/agent-boxes/` (or `$CLAUDE_CONFIG_DIR/agent-boxes/`). Delete that folder to clear cached Antigravity quota readings. `quota.json` there holds the latest Codex and Antigravity windows for agent-router.
 - **Uninstall:** run `/plugin uninstall agent-boxes` in Claude Code, or `claude plugin uninstall agent-boxes@agent-boxes` from your shell.
 
 ## Develop
 
 ```sh
 git clone https://github.com/michaelbystryk/agent-boxes
-claude --plugin-dir ./agent-boxes      # run a chat with your working copy
-claude plugin validate ./agent-boxes
-claude plugin test ./agent-boxes
-(cd agent-boxes && python3 -E -m unittest tests/test_scan.py)   # the scanners' tests
-python3 -E agent-boxes/scripts/boxes.py <session-id>   # the scan's raw JSON
+cd agent-boxes
+claude --plugin-dir plugins/agent-boxes      # run a chat with your working copy
+claude plugin validate .                     # the marketplace
+claude plugin validate plugins/agent-boxes
+claude plugin test plugins/agent-boxes
+(cd plugins/agent-boxes && python3 -E -m unittest tests/test_scan.py)   # the scanners' tests
+python3 -E plugins/agent-boxes/scripts/boxes.py <session-id>   # the scan's raw JSON
 ```
 
-`hooks/register.tsx` is the side bar. `scripts/` holds the Codex and Antigravity scanners.
+`plugins/agent-boxes/hooks/register.tsx` is the side bar. `plugins/agent-boxes/scripts/` holds the Codex and Antigravity scanners. agent-router lives in `plugins/agent-router` ([its README](plugins/agent-router/README.md)).
 
 ## License
 

@@ -51,6 +51,16 @@ def window_used(w, now_ms):
     return w["usedPercent"]
 
 
+def window_raw(w, now_ms):
+    """A window for the router: {used, resetsAtMs}; used is 0 once it has reset, None when unknown."""
+    if w is None:
+        return None
+    out = {"used": window_used(w, now_ms)}
+    if w.get("resetsAt") is not None and w["resetsAt"] * 1000 > now_ms:
+        out["resetsAtMs"] = int(w["resetsAt"] * 1000)
+    return out
+
+
 def window_text(label, w, now_ms):
     if w is None:
         return f"{label} –"
@@ -108,6 +118,7 @@ def codex_box(session_id, rows=None, prepare=False):
         "agents": agent_rows(scan["agents"], now),
         "fiveHour": window_used(five, now),
         "sevenDay": window_used(week, now),
+        "windows": {"5h": window_raw(five, now), "7d": window_raw(week, now)},
     }
 
 
@@ -145,6 +156,10 @@ def agy_box(session_id, rows=None, prepare=False):
         "agents": agent_rows(scan["agents"], now),
         "fiveHour": window_used(window(gemini, "5h"), now),
         "sevenDay": window_used(window(gemini, "7d"), now),
+        "windows": {"5h": window_raw(window(gemini, "5h"), now), "7d": window_raw(window(gemini, "7d"), now)},
+        # every model group's windows (agy also runs Claude and GPT-OSS on its own quota), for agent-router
+        "groups": {name: {"5h": window_raw(window(g, "5h"), now), "7d": window_raw(window(g, "7d"), now)}
+                   for name, g in groups.items()},
     }
     if not groups and not agy_usage.AGY:
         box["hint"] = "quota needs agy on PATH"

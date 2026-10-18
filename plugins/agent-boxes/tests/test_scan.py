@@ -392,6 +392,17 @@ class UsageTests(Files):
                 self.assertEqual(runpy.run_path(usage.__file__)["AGY"], expected)
 
 
+class WindowTests(unittest.TestCase):
+    def test_raw_window_for_the_router(self):
+        now = 1_000_000_000
+        self.assertIsNone(boxes.window_raw(None, now))
+        self.assertEqual(boxes.window_raw({"usedPercent": 40, "resetsAt": 2_000_000}, now),
+                         {"used": 40, "resetsAtMs": 2_000_000_000})
+        # a window past its reset is empty and has no reset time
+        self.assertEqual(boxes.window_raw({"usedPercent": 40, "resetsAt": 10}, now), {"used": 0})
+        self.assertEqual(boxes.window_raw({"usedPercent": None}, now), {"used": None})
+
+
 class BornTests(unittest.TestCase):
     def test_posix_append_keeps_the_cache(self):
         # On POSIX st_ctime moves on every append, so it must not be part of a file's identity.

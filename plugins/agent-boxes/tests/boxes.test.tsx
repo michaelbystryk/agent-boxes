@@ -67,6 +67,8 @@ type Setup = {
   messages?: SessionMessage[]
   // agent-boxes/config.json: an object is written as JSON, a string as is; absent by default.
   config?: object | string
+  // agent-router's route file for this session; absent by default.
+  route?: object
 }
 
 type World = {
@@ -77,6 +79,7 @@ type World = {
   completes: () => number
   lists: () => number
   logs: string[]
+  writes: Map<string, string>
 }
 
 const TOOL_FOLDERS = ['/home/u/.codex', '/home/u/.gemini/antigravity-cli']
@@ -93,9 +96,11 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
   let completes = 0
   let lists = 0
   const logs: string[] = []
+  const writes = new Map<string, string>()
   const taskDir = '/home/u/.claude/tasks/sess-1'
   const configPath = '/home/u/.claude/agent-boxes/config.json'
   const { config } = setup
+  const routePath = '/home/u/.claude/agent-router/route-sess-1.json'
   on('session.id', () => ({ value: 'sess-1' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.usage', () => ({
@@ -113,7 +118,8 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
     value:
       (unix(e.path) === taskDir && Object.keys(tasks).length > 0) ||
       folders.includes(unix(e.path)) ||
-      (config !== undefined && unix(e.path) === configPath),
+      (config !== undefined && unix(e.path) === configPath) ||
+      (setup.route !== undefined && unix(e.path) === routePath),
   }))
   on('fs.list', () => ({
     value: Object.keys(tasks).map(name => ({ name, kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
@@ -121,8 +127,14 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
   on('fs.read', (_$, e) =>
     unix(e.path) === configPath && config !== undefined
       ? { value: typeof config === 'string' ? config : JSON.stringify(config) }
+      : unix(e.path) === routePath
+      ? { value: JSON.stringify(setup.route) }
       : { value: JSON.stringify(tasks[unix(e.path).slice(taskDir.length + 1)]) },
   )
+  on('fs.write', (_$, e) => {
+    writes.set(unix(e.path), e.text)
+    return { value: undefined }
+  })
   on('agent.list', () => {
     lists++
     return {
@@ -199,7 +211,7 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
   })
   await $.session.start({ cwd: '.', surface: 'terminal', isInteractive: true })
   await clock.settle()
-  return { argvs, clock, scans, checks, completes: () => completes, lists: () => lists, logs }
+  return { argvs, clock, scans, checks, completes: () => completes, lists: () => lists, logs, writes }
 }
 
 test('each tool gets its own box with its agents', async ($, on) => {
@@ -234,6 +246,36 @@ test('each tool gets its own box with its agents', async ($, on) => {
   expect(run?.[1]).toBe('-E')
   expect(run?.at(-2)).toMatch(/scripts[\\/]boxes\.py$/)
   expect(run?.at(-1)).toBe('sess-1')
+})
+
+test("agent-router's pick shows in the next box", async ($, on) => {
+  await start($, on, { route: { category: 'blender', pick: 'agy-argon', why: 'Claude 5h 82%', atMs: 1 } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /⇄ agy-argon/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Claude 5h 82%/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the scan shares Codex and agy windows with agent-router', async ($, on) => {
+  const scan = {
+    codex: { ...SCAN.codex, windows: { '5h': { used: 3 }, '7d': { used: 35, resetsAtMs: 9 } } },
+    agy: { ...SCAN.agy, groups: { gemini: { '5h': { used: 0 }, '7d': null }, 'claude/gpt': { '5h': { used: 10 } } } },
+  }
+  const { writes } = await start($, on, { scan })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const file = writes.get('/home/u/.claude/agent-boxes/quota.json')
+  await ui.unmount()
+  const shared = JSON.parse(file ?? '{}')
+  expect(shared.codex['7d']).toEqual({ used: 35, resetsAtMs: 9 })
+  expect(shared.agy['claude/gpt']['5h'].used).toBe(10)
+  expect(typeof shared.atMs).toBe('number')
+})
+
+test('no route line without agent-router', async ($, on) => {
+  await start($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /⇄/ })).toBeUndefined()
+  await ui.unmount()
 })
 
 const HINT = {
