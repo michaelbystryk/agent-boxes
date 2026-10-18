@@ -3,14 +3,20 @@
 A side bar for [Claude Code](https://claude.com/claude-code) that shows, at a glance:
 
 - **Usage meters** for Claude, and for [Codex](https://github.com/openai/codex) and Antigravity if you use them: the 7-day and 5-hour windows, with a border that turns yellow at 60% and red at 85%.
-- **What every running agent is doing**: Claude's subagents and any Codex runs this chat started, each with its latest action (`↳ $ npm test`, `↳ editing app.ts`), plus any Antigravity runs this chat started (title, model, steps and elapsed time).
-- **Now**: the task in progress, a progress bar, and the steps left, taken from Claude's task list.
-- **Next**: a one-line recommendation for what to do after this turn.
-- **Router**: who should take the task you just asked for, picked across Claude, Codex and Antigravity from public benchmarks and live quota (see [Router](#router)).
+- **What every running agent is doing**: Claude's subagents and any Codex runs this chat started, each with its latest action (`↳ $ npm test`, `↳ editing app.ts`), plus any Antigravity runs this chat started (title, model, steps and elapsed time). Runs that Claude hands to Codex or Antigravity through the relays show in that tool's box, marked `✻`.
+- **Now**: the task in progress, a progress bar, and the steps left, taken from Claude's task list (or summarised when there is none), plus `⏳ waiting on you` when Claude needs your answer.
+- **Next**: a one-line recommendation for what to do after this turn, and why.
+- **Router**: who should take the task you just asked for, picked across Claude, Codex and Antigravity from public benchmarks and live quota. The Router box shows the pick, the reason and a fallback (see [Router](#router)).
 
-![agent-boxes: three example side bars, each with Claude, Codex, Antigravity, Now and Next boxes](docs/hero.png)
+![agent-boxes: three example side bars, each with Claude, Codex, Antigravity, Now, Next and Router boxes](docs/hero.png)
 
-Each box's border goes green, then yellow at 60% of its 7-day window, then red at 85%. The meters are gradients in each company's colours. These are simulated examples; the side bar is 48 columns wide by default. Full size: [crunch](docs/crunch.png) · [steady](docs/steady.png) · [light](docs/light.png).
+Each usage box's border goes green, then yellow at 60% of its 7-day window, then red at 85%. The meters are gradients in each company's colours. A run with Claude's `✻` in front was started by one of Claude's relay subagents; `starting…` and `reporting back` mark a relay before its run turns up and after it ends. The three side bars show three states of the router:
+
+- **crunch:** Claude is past its 7-day limit, so in `steer` mode the router sends a refactor to Opus on agy's quota.
+- **steady:** Antigravity is nearly out, so a design task goes to GPT-6 Astra, which is already running it in the Codex box.
+- **light:** no prompt has been routed yet, so the router shows the pool best placed right now.
+
+These are simulated examples; the side bar is 48 columns wide by default. Full size: [crunch](docs/crunch.png) · [steady](docs/steady.png) · [light](docs/light.png).
 
 ## Install
 
@@ -164,6 +170,8 @@ In `plugins/agent-boxes/`:
 - `hooks/catalog.ts` holds the executors and rankings.
 - `agents/` holds the Codex and agy relays.
 - `scripts/` holds the Codex and Antigravity scanners.
+
+`docs/make_shots.py` draws the README screenshots from made-up scenes, with the side bar's own colours and layout: `python docs/make_shots.py docs` (needs Pillow and the Windows Consolas font).
 
 ## License
 
