@@ -32,6 +32,8 @@ claude plugin install agent-boxes@agent-boxes
 
 Any other chat that's already open needs `/reload-plugins` too.
 
+If the install says "userConfig options not yet set", that's fine: every option has a default. See [Options](#options) to change them.
+
 To update later, run `claude plugin update agent-boxes@agent-boxes`, then `/reload-plugins` in open chats.
 
 ### What it needs
