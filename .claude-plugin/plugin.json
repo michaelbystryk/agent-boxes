@@ -1,6 +1,6 @@
 {
   "name": "agent-boxes",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A side bar for Claude Code: Claude, Codex and Antigravity usage meters, what each running agent is doing, the current task, and a recommended next step",
   "author": { "name": "Michael Bystryk", "url": "https://github.com/michaelbystryk" },
   "homepage": "https://github.com/michaelbystryk/agent-boxes",
