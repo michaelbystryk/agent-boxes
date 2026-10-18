@@ -43,7 +43,8 @@ To update later, run `claude plugin update agent-boxes@agent-boxes`, then `/relo
 | **The fullscreen TUI** | Required for the side bar. Turn it on in `/config`, or set `"tui": "fullscreen"` in `~/.claude/settings.json`. |
 | **A terminal at least 144 columns wide** | The side bar opens by itself from 144 columns, and from 110 once you've opened it with `/agent-boxes`. |
 | **Python 3.8+** on `PATH` | Needed only for the Codex and Antigravity boxes. The Claude, Now and Next boxes work without it. |
-| **Codex / Antigravity** | Optional. Each tool's box appears only when the tool is installed (`~/.codex` or `$CODEX_HOME`, `~/.gemini/antigravity-cli`). |
+| **Codex / Antigravity** | Optional. Each tool's box appears only when the tool is installed (`~/.codex` or `$CODEX_HOME`, `~/.gemini/antigravity-cli`). To run the relays, `codex` and `agy` must be on `PATH` and signed in. On Windows, agy installs to `%LOCALAPPDATA%\agy\bin`, so add that folder to `PATH`. |
+| **An auto-mode note** | Only if you use auto mode. Without it, auto mode blocks the relays' launches. See [Auto mode](#auto-mode). |
 
 ## Options
 
@@ -86,6 +87,16 @@ Each executor runs as a subagent type. Your own definition wins: `~/.claude/agen
 - Claude's `scout`, `worker` and `architect` become `general-purpose` on Haiku, Sonnet or Opus.
 
 The relays run `codex exec -s workspace-write` and `agy -p … --sandbox --dangerously-skip-permissions`, or read-only / `--mode plan` for reviews and plans. Both sandboxes keep a run's commands to its project folder, with no network. Headless agy can't ask before a shell command: without `--dangerously-skip-permissions` it denies them all, and `--mode auto` isn't available on every account. That's why `--sandbox` is what bounds it. Headless `--mode plan` lets agy open no files, so the relay pastes the files the brief names into the brief. Claude Code still asks you before each launch unless your permission rules allow it.
+
+### Auto mode
+
+Auto mode reads agy's `--dangerously-skip-permissions` as an unrestricted agent and blocks the launch ("Create Unsafe Agents"). It can block Codex relays as well. A plugin can't change auto mode's rules, so add this note yourself: put it in the `autoMode.allow` list in `~/.claude/settings.json`, and add `"$defaults"` to that list too if you are creating it.
+
+```json
+"agent-boxes relays: the agent-boxes relay agents (codex-builder, codex-astra, agy-argon, agy-flash, agy-opus) launching a headless run in a project folder the user is working on in this session is routine and authorized. That covers `codex exec` with `-s workspace-write` or `-s read-only`, and `agy -p` with `--sandbox --dangerously-skip-permissions` or `--mode plan`. The brief and output files go in the session scratchpad. It does not cover `agy` without `--sandbox`, codex's `--dangerously-bypass-approvals-and-sandbox` or `-s danger-full-access`, or runs pointed at folders outside the project and the scratchpad."
+```
+
+The note covers only the sandboxed launches, so a run without a sandbox is still blocked. Chats that are already open pick it up after `/reload-plugins`. To undo it, delete the line.
 
 ### Router options
 
