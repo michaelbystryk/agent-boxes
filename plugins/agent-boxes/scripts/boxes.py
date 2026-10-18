@@ -172,6 +172,13 @@ def agy_box(session_id, rows=None, prepare=False):
     return box
 
 
+def claude_box(session_id):
+    """This session's headless `claude -p` bench runs; its own subagents come from the engine."""
+    import bench_scan
+
+    return {"agents": agent_rows(bench_scan.runs(session_id, "claude"), time.time() * 1000)}
+
+
 def box(fn, session_id, **kwargs):
     try:
         return fn(session_id, **kwargs)
@@ -189,6 +196,7 @@ def main():
     prepared = {name: box(fn, session_id, prepare=True) for name, fn in scanners.items()}
     out = {name: data if isinstance(data, dict) else box(scanners[name], session_id, rows=data)
            for name, data in prepared.items()}
+    out["claude"] = box(claude_box, session_id)
     out["atMs"] = int(time.time() * 1000)
     sys.stdout.buffer.write(json.dumps(out, ensure_ascii=False).encode("utf-8"))
 

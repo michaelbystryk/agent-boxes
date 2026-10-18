@@ -42,7 +42,7 @@ STATE = os.path.join(CLAUDE_HOME, "agent-boxes")
 _TRANSCRIPTS = {}
 _COMMANDS = {}
 _READ_BUDGET = None
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 TRANSCRIPT_BYTES = 64 * 1024 * 1024
 TRANSCRIPT_SECONDS = 2
 RECORD_BYTES = 4 * 1024 * 1024
@@ -283,7 +283,7 @@ def load_transcript(cache, stat, path):
 def extract_calls(raw, data, since_ms):
     handoff = b'"continued-in"' in raw
     shell = ((b'"Bash"' in raw or b'"PowerShell"' in raw)
-             and (b"codex" in raw or b"agy" in raw))
+             and (b"codex" in raw or b"agy" in raw or b"bench.py" in raw))
     if not (handoff or shell):
         return
     try:
@@ -301,7 +301,7 @@ def extract_calls(raw, data, since_ms):
         inp = obj(block.get("input"))
         command = inp.get("command")
         if (block.get("type") == "tool_use" and block.get("name") in SHELL_TOOLS
-                and isinstance(command, str) and ("codex" in command or "agy" in command)):
+                and isinstance(command, str) and any(k in command for k in ("codex", "agy", "bench.py"))):
             data["calls"].extend(parsed_calls(at_ms, command, inp.get("cwd") or ev.get("cwd")))
 
 
@@ -427,8 +427,11 @@ def session_commands(session_id):
 
 
 def session_calls(session_id):
-    """The session's `codex exec` calls: when, the -C dir, and the brief fed on stdin."""
-    return [c for c in session_commands(session_id) if c["kind"] == "codex"]
+    """The session's `codex exec` calls: when, the -C dir, and the brief fed on stdin.
+    A bench.py launch counts as a call with only its bench dir."""
+    return [c if c["kind"] == "codex" else {"atMs": c["atMs"], "kind": "codex", "cwd": c["cwd"]}
+            for c in session_commands(session_id)
+            if c["kind"] == "codex" or (c["kind"] == "bench" and c["agent"] == "codex")]
 
 
 def expand(text, env):
@@ -605,6 +608,18 @@ def parsed_calls(at_ms, command, cwd=None):
             args = [w for w in words[1:] if w.lower() not in ("-path", "-literalpath")]
             if args:
                 cwd = resolve_path(expand(args[0], env), cwd)
+        elif name in ("python", "python3", "py"):
+            # llm-blender-bench: `python tools/bench.py run <agent> <task>` starts that agent's CLI
+            # headless, working in <repo>/benches/<agent>/<task>
+            args = [w for w in words[1:] if not w.startswith("-")]
+            if (len(args) >= 4 and re.split(r"[\\/]", args[0])[-1] == "bench.py" and args[1] == "run"
+                    and args[2] in ("claude", "codex", "agy")):
+                script = resolve_path(expand(args[0], env), cwd)
+                if script:
+                    paths = ntpath if os.name == "nt" else posixpath
+                    repo = paths.dirname(paths.dirname(script))
+                    out.append({"atMs": at_ms, "kind": "bench", "agent": args[2], "task": args[3], "repo": repo,
+                                "cwd": paths.join(repo, "benches", args[2], args[3])})
         elif name in ("codex", "agy"):
             call = {"atMs": at_ms, "kind": name,
                     "cwd": host_path(expand(cwd, env)) if cwd else None}

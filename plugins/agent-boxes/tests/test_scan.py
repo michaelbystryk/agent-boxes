@@ -420,5 +420,91 @@ class SubstitutionTests(unittest.TestCase):
         self.assertEqual(codex.prompts(call), ["fix the"])
 
 
+class BenchTests(Files):
+    """llm-blender-bench runs, started as `python tools/bench.py run <agent> <task>`."""
+
+    def setUp(self):
+        super().setUp()
+        import bench_scan
+        self.bench = bench_scan
+        self.repo = self.root / "repo"
+        (self.repo / "tools").mkdir(parents=True)
+
+    def launch(self, agent="agy", at=None):
+        at = time.time() * 1000 if at is None else at
+        command = f'cd "{self.repo}" && python tools/bench.py run {agent} T1_chest > out.txt 2>&1'
+        return codex.parsed_calls(at, command, str(self.root))
+
+    def run_log(self, agent, lines, n=1):
+        d = self.repo / "benches" / agent / "T1_chest" / "runs" / str(n)
+        d.mkdir(parents=True)
+        (d / "prompt.md").write_text("brief")
+        (d / "agent_log.jsonl").write_text("\n".join(json.dumps(x, separators=(",", ":")) for x in lines))
+        return d
+
+    def rows(self, agent, calls):
+        with patch.object(codex, "session_commands", lambda _: calls):
+            return self.bench.runs("s", agent)
+
+    def test_launch_parses_to_the_bench_dir(self):
+        [call] = self.launch(at=1000)
+        self.assertEqual((call["kind"], call["agent"], call["task"]), ("bench", "agy", "T1_chest"))
+        self.assertEqual(codex.norm_path(call["cwd"]), codex.norm_path(str(self.repo / "benches" / "agy" / "T1_chest")))
+        self.assertEqual(codex.parsed_calls(1000, "python tools/bench.py review T1_chest", str(self.repo)), [])
+        self.assertEqual(codex.parsed_calls(1000, "python tools/bench.py run gemini T1_chest", str(self.repo)), [])
+
+    def test_codex_launch_is_a_codex_call(self):
+        calls = self.launch("codex", 1000)
+        with patch.object(codex, "session_commands", lambda _: calls):
+            [call] = codex.session_calls("s")
+        self.assertEqual((call["kind"], call["cwd"]), ("codex", calls[0]["cwd"]))
+
+    def test_live_agy_run_and_its_last_command(self):
+        calls = self.launch()
+        self.run_log("agy", [
+            {"event": "step_update", "step_update": {"step_index": 3, "step_type": "tool", "tool_name": "run_command",
+                                                     "tool_info": {"parameters": {"CommandLine": "python -c \"\nprint(1)\""}}}},
+            {"event": "step_update", "step_update": {"step_index": 4, "step_type": "agent_response"}},
+        ])
+        [row] = self.rows("agy", calls)
+        self.assertEqual((row["task"], row["steps"], row["now"]), ("T1_chest run 1", 4, '$ python -c " print(1)"'))
+
+    def test_claude_run_counts_tool_calls(self):
+        calls = self.launch("claude")
+        use = lambda name, i: {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": name, "input": i}]}}
+        self.run_log("claude", [use("Bash", {"command": "ls"}), {"type": "user"}, use("Read", {"file_path": "/x/a.png"})])
+        [row] = self.rows("claude", calls)
+        self.assertEqual((row["count"], row["now"]), ("2 tools", "Read a.png"))
+
+    def test_finished_runs_drop_out(self):
+        calls = self.launch()
+        d = self.run_log("agy", [{"event": "result", "result": {"status": "SUCCESS"}}])
+        self.assertEqual(self.rows("agy", calls), [])
+        (d / "agent_log.jsonl").write_text(json.dumps({"event": "step_update", "step_update": {}}))
+        self.assertEqual(len(self.rows("agy", calls)), 1)
+        (self.repo / "results" / "T1_chest").mkdir(parents=True)
+        (self.repo / "results" / "T1_chest" / "runs.json").write_text(
+            json.dumps([{"agent": "agy", "run": 1, "run_dir": "benches/agy/T1_chest/runs/1"}]))
+        self.assertEqual(self.rows("agy", calls), [])
+
+    def test_an_older_run_is_not_this_call(self):
+        self.run_log("agy", [{"event": "step_update", "step_update": {}}])
+        old = self.repo / "benches" / "agy" / "T1_chest" / "runs" / "1" / "prompt.md"
+        os.utime(old, (time.time() - 3600, time.time() - 3600))
+        self.assertEqual(self.rows("agy", self.launch()), [])
+
+    def test_agy_db_row_of_a_bench_run_is_not_listed_twice(self):
+        calls = self.launch()
+        self.run_log("agy", [{"event": "step_update", "step_update": {"step_index": 1}}])
+        now = time.time() * 1000
+        row = {"conversation_id": "c", "inputAtMs": now + 1000, "modifiedAtMs": now, "parent_conversation_id": None,
+               "workspace_uris": json.dumps([(self.repo / "benches" / "agy" / "T1_chest").as_uri()]),
+               "killed": 0, "status": "CASCADE_RUN_STATUS_RUNNING", "not_fully_idle": 1, "title": "t", "preview": "",
+               "agent_name": "", "step_count": 1}
+        with patch.object(codex, "session_commands", lambda _: calls):
+            agents = agy.scan("s", rows=[row])["agents"]
+        self.assertEqual([a["nickname"] for a in agents], ["bench"])
+
+
 if __name__ == "__main__":
     unittest.main()

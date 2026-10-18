@@ -16,6 +16,7 @@ from urllib.parse import unquote, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import bench_scan
 import codex_scan
 
 HOME = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-cli")
@@ -37,6 +38,10 @@ def session_calls(session_id):
             paths = c.get("cwd") or []
             paths = [paths] if isinstance(paths, str) else paths
             calls.append({**c, "dirs": {codex_scan.norm_path(p) for p in paths} - {None}})
+        elif c["kind"] == "bench" and c["agent"] == "agy":
+            # paired so it can't be mistaken for another call's run; listed by bench_scan instead
+            calls.append({"atMs": c["atMs"], "kind": "agy", "bench": True,
+                          "dirs": {codex_scan.norm_path(c["cwd"]), codex_scan.norm_path(c["repo"])} - {None}})
     return calls
 
 
@@ -131,7 +136,8 @@ def scan(session_id, rows=None):
     agents = []
     for r in rows:
         call = mine.get(r["conversation_id"])
-        if call is None or not running(r, now_ms):
+        # headless agy leaves its DB row idle mid-run, so bench.py runs are listed from their logs below
+        if call is None or call.get("bench") or not running(r, now_ms):
             continue
         agents.append({
             "id": r["conversation_id"],
@@ -143,6 +149,7 @@ def scan(session_id, rows=None):
             "steps": r["step_count"] or 0,
             "startedAtMs": int(call["atMs"]),
         })
+    agents += bench_scan.runs(session_id, "agy")
     agents.sort(key=lambda a: a["startedAtMs"])
     return {"nowMs": now_ms, "agents": agents}
 
