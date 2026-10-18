@@ -38,7 +38,7 @@ class Files(unittest.TestCase):
         self.state.mkdir()
         for module, key, value in (
             (codex, "STATE", str(self.state)), (codex, "_TRANSCRIPTS", {}),
-            (codex, "_COMMANDS", {}), (codex, "_READ_BUDGET", None),
+            (codex, "_COMMANDS", {}), (codex, "_LAUNCHES", {}), (codex, "_READ_BUDGET", None),
             (usage, "STATE", str(self.state)), (usage, "CACHE", str(self.state / "agy_usage.json")),
             (usage, "LOCK", str(self.state / "agy_usage.lock")), (usage, "_LOCKS", {}),
         ):
@@ -520,6 +520,220 @@ class BenchTests(Files):
         with patch.object(codex, "session_commands", lambda _: calls):
             agents = agy.scan("s", rows=[row])["agents"]
         self.assertEqual([a["nickname"] for a in agents], ["bench"])
+
+
+class ProcessTests(Files):
+    """Runs found as live processes: started through xargs, loops or scripts the transcript can't parse."""
+
+    def setUp(self):
+        super().setUp()
+        import procs
+        self.procs = procs
+        self.projects = self.root / "projects"
+        (self.projects / "p").mkdir(parents=True)
+        p = patch.object(codex, "CLAUDE_PROJECTS", str(self.projects))
+        p.start()
+        self.addCleanup(p.stop)
+        self.now = int(time.time()) * 1000  # transcript timestamps are whole seconds
+
+    def proc(self, pid, ppid, argv, start=None, session="s", cwd=None, name=None):
+        p = self.procs.Proc(pid, ppid, name or os.path.basename(argv[0]), self.now if start is None else start)
+        p.argv, p.cwd = argv, cwd or str(self.root)
+        p.env = {"CLAUDE_CODE_SESSION_ID": session} if session else {}
+        return p
+
+    def live(self, *found):
+        tree = {p.pid: p for p in found}
+        with patch.object(self.procs, "launches", lambda ids: ([p for p in found if p.env.get("CLAUDE_CODE_SESSION_ID") in ids], tree)):
+            return codex.live_launches({"s"})
+
+    def say(self, command, at=None, session="s", agent=None):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime((self.now if at is None else at) / 1000))
+        line = {"type": "assistant", "timestamp": stamp, "cwd": str(self.root),
+                "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": command}}]}}
+        path = self.projects / "p" / (session + ".jsonl")
+        if agent:
+            path = self.projects / "p" / session / "subagents" / f"agent-{agent}.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(line) + "\n")
+
+    def commands(self, found):
+        codex._COMMANDS.clear()
+        codex._TRANSCRIPTS.clear()
+        tree = {p.pid: p for p in found}
+        with patch.object(codex, "PROCESSES", True), \
+                patch.object(self.procs, "launches", lambda ids: ([p for p in found if p.env.get("CLAUDE_CODE_SESSION_ID") in ids], tree)):
+            return codex.session_commands("s")
+
+    def test_xargs_bench_runs_are_found_with_their_parent_gone(self):
+        found = [self.proc(10 + i, 999, ["C:\\Python313\\python.exe", "tools/bench.py", "run", agent, "T2"], cwd=str(self.root))
+                 for i, agent in enumerate(("codex", "agy", "claude"))]
+        found += [self.proc(20, 10, ["codex.exe", "exec", "--json", "-"], start=self.now + 500),
+                  self.proc(21, 11, ["agy.EXE", "-p", "brief"], start=self.now + 500)]
+        calls = self.live(*found)
+        self.assertEqual(sorted((c["kind"], c["agent"]) for c in calls),
+                         [("bench", "agy"), ("bench", "claude"), ("bench", "codex")])
+        self.assertTrue(all(c["alive"] for c in calls))
+
+    def test_other_chats_runs_are_not_ours(self):
+        self.assertEqual(self.live(self.proc(10, 1, ["codex", "exec", "x"], session="other")), [])
+
+    def test_nested_codex_runs_stay_separate_but_a_launcher_is_one(self):
+        calls = self.live(self.proc(10, 1, ["node", "/usr/lib/node_modules/@openai/codex/bin/codex.js", "exec", "outer"]),
+                          self.proc(11, 10, ["codex-x86_64-unknown-linux-musl", "exec", "outer"], start=self.now + 100),
+                          self.proc(12, 11, ["codex", "exec", "inner"], start=self.now + 60000))
+        self.assertEqual(sorted(c["prompt"] for c in calls), ["inner", "outer"])
+
+    def test_process_words_are_taken_literally(self):
+        [call] = self.live(self.proc(10, 1, ["codex", "exec", "it's > $HOME `x`"]))
+        self.assertEqual(call["prompt"], "it's > $HOME `x`")
+
+    def test_launch_argv_names(self):
+        self.assertEqual(codex.launch_argv(["C:\\Python313\\python3.13w.exe", "a"]), ["python", "a"])
+        self.assertEqual(codex.launch_argv(["py", "a"]), ["python", "a"])
+        self.assertEqual(codex.launch_argv(["node", "server.js"]), [])
+        self.assertEqual(codex.launch_argv(["bash", "-c", "codex exec x"]), [])
+
+    def test_unreadable_and_foreign_processes_are_skipped(self):
+        me = os.getpid()
+        ps = {1: self.procs.Proc(1, 0, "codex.exe"), 2: self.procs.Proc(2, 0, "agy.exe"),
+              3: self.procs.Proc(3, 0, "python.exe"), 4: self.procs.Proc(4, 0, "explorer.exe"),
+              me: self.procs.Proc(me, 0, "python.exe")}
+
+        def details(p):
+            if p.pid == 2:
+                raise OSError("no access")
+            p.startMs, p.argv = 1, ["x"]
+            p.env = {"CLAUDE_CODE_SESSION_ID": "s" if p.pid in (1, 4, me) else "t", "CLAUDE_PID": "77" if p.pid == 3 else ""}
+
+        with patch.object(self.procs, "platform", lambda: (lambda: ps, details)), patch.dict(os.environ, {"CLAUDE_PID": "77"}):
+            found, _ = self.procs.launches({"s"})
+        self.assertEqual(sorted(p.pid for p in found), [1, 3])
+
+    def test_a_run_that_ended_between_polls_still_counts(self):
+        both = [self.proc(10, 1, ["codex", "exec", "a"]), self.proc(11, 1, ["codex", "exec", "b"], start=self.now + 10)]
+        self.assertEqual(len(self.commands(both)), 2)
+        calls = self.commands(both[1:])
+        self.assertEqual(sorted((c["prompt"], bool(c.get("alive"))) for c in calls), [("a", False), ("b", True)])
+
+    def test_a_reused_pid_is_a_new_run(self):
+        self.commands([self.proc(10, 1, ["codex", "exec", "a"], start=self.now - 60000)])
+        calls = self.commands([self.proc(10, 1, ["codex", "exec", "b"])])
+        self.assertEqual(sorted(c["prompt"] for c in calls), ["a", "b"])
+
+    def test_the_command_that_started_a_process_lends_it_its_subagent(self):
+        sub = self.projects / "p" / "s" / "subagents"
+        sub.mkdir(parents=True)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now / 1000 - 1))
+        (sub / "agent-a1b2.jsonl").write_text(json.dumps(
+            {"type": "assistant", "timestamp": stamp,
+             "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": 'codex exec "fix it"'}}]}}) + "\n")
+        self.say("ls")
+        [call] = self.commands([self.proc(10, 1, ["codex", "exec", "fix it"])])
+        self.assertEqual((call["via"], call["alive"]), ("a1b2", True))
+
+    def test_bench_calls_survive_a_cache_reload(self):
+        self.say("python tools/bench.py run agy T1")
+        path = self.projects / "p" / "s.jsonl"
+        self.assertEqual([c["kind"] for c in self.poll(path)["calls"]], ["bench"])
+        self.assertEqual([c["kind"] for c in self.poll(path)["calls"]], ["bench"])
+
+    def test_launches_the_transcript_cannot_parse_are_counted_until_a_process_shows(self):
+        self.say("ls tasks | xargs -P3 -I{} codex exec {}")
+        self.say("codex exec 'parsed fine'")
+        self.commands([])
+        self.assertEqual(codex.unverified("s"), 1)
+        self.commands([self.proc(10, 1, ["codex", "exec", "t1"], start=self.now + 1000)])
+        self.assertEqual(codex.unverified("s"), 0)
+
+    def test_only_real_launches_count_as_unparsed(self):
+        for command in ("ls tasks | xargs -P3 -I{} codex exec {}",
+                        "printf '%s\\n' codex agy | xargs -P2 -I{} python tools/bench.py run {} T2",
+                        "ls | xargs -P3 sh -c 'python tools/bench.py run codex T2'",
+                        'bash -c "codex.exe exec --json x"'):
+            self.assertTrue(codex.looks_like_launch(command), command)
+        for command in ("python - <<'X'\na='runs `codex exec` or `agy -p`'\nX",
+                        'echo "never appears as codex exec here"',
+                        "grep -n 'codex exec' file",
+                        "Get-Process | Where-Object { $_.CommandLine -match 'bench\\.py run|codex exec' }"):
+            self.assertFalse(codex.looks_like_launch(command), command)
+
+    def test_a_launcher_and_its_binary_stay_one_launch_across_polls(self):
+        launcher = self.proc(10, 1, ["node", "/usr/lib/node_modules/@openai/codex/bin/codex.js", "exec", "a"])
+        native = self.proc(11, 10, ["codex-x86_64-unknown-linux-musl", "exec", "a"], start=self.now + 100)
+        self.assertEqual(len(self.commands([launcher, native])), 1)
+        self.assertEqual(len(self.commands([native])), 1)  # the launcher can no longer be read
+
+    def test_merged_launches_keep_the_command_time_so_bursts_still_pair(self):
+        self.say("codex exec 'one'", at=self.now)
+        self.say("codex exec 'two'", at=self.now + 1000)
+        calls = self.commands([self.proc(10, 1, ["codex", "exec", "one"], start=self.now + 2000),
+                               self.proc(11, 1, ["codex", "exec", "two"], start=self.now + 8000)])
+        self.assertEqual(sorted(c["atMs"] - self.now for c in calls), [0, 1000])
+        rows = [{"id": k, "created_at_ms": self.now + d, "source": "exec", "cwd": str(self.root), "first_user_message": m}
+                for k, d, m in (("r1", 10000, "one"), ("r2", 11000, "two"))]
+        self.assertEqual(set(codex.ours(rows, calls)), {"r1", "r2"})
+
+    def test_parallel_launches_pair_with_their_commands_in_order(self):
+        self.say("codex exec 'task'", at=self.now, agent="a1")
+        self.say("codex exec 'task'", at=self.now + 1000, agent="b2")
+        self.say("codex exec 'other'", at=self.now + 1000, agent="c3")
+        calls = self.commands([self.proc(10, 1, ["codex", "exec", "task"], start=self.now + 2000),
+                               self.proc(11, 1, ["codex", "exec", "task"], start=self.now + 3000),
+                               self.proc(12, 1, ["codex", "exec", "other"], start=self.now + 3500)])
+        self.assertEqual([(c["prompt"], c["via"]) for c in sorted(calls, key=lambda c: c["startMs"])],
+                         [("task", "a1"), ("task", "b2"), ("other", "c3")])
+
+    def test_a_launch_that_could_be_either_command_gets_no_subagent(self):
+        self.say("codex exec 'task'", at=self.now, agent="a1")
+        self.say("codex exec 'task'", at=self.now + 1000, agent="b2")
+        calls = self.commands([self.proc(10, 1, ["codex", "exec", "task"], start=self.now + 2000)])
+        [launch] = [c for c in calls if c.get("alive")]
+        self.assertIsNone(launch["via"])
+
+    def test_a_process_without_a_cwd_takes_the_commands(self):
+        self.say("agy -p 'go'")
+        p = self.proc(10, 1, ["agy", "-p", "go"], start=self.now + 500)
+        p.cwd = None
+        [call] = self.commands([p])
+        self.assertEqual([codex.norm_path(d) for d in call["cwd"]], [codex.norm_path(str(self.root))])
+
+    def test_an_xargs_launch_in_a_subagent_keeps_that_subagent(self):
+        self.say("ls briefs | xargs -P2 -I{} sh -c 'codex exec \"$(cat {})\"'", agent="a1")
+        calls = self.commands([self.proc(10, 1, ["codex", "exec", "brief one"], start=self.now + 500),
+                               self.proc(11, 1, ["codex", "exec", "brief two"], start=self.now + 600)])
+        self.assertEqual([c["via"] for c in calls], ["a1", "a1"])
+
+    def test_only_a_run_of_its_kind_clears_an_unparsed_launch(self):
+        self.say("ls tasks | xargs -I{} codex exec {}")
+        self.commands([self.proc(10, 1, ["agy", "-p", "x"], start=self.now + 1000)])
+        self.assertEqual(codex.unverified("s"), 1)
+
+    def test_a_broken_launches_file_is_ignored(self):
+        for body in ('{"version": 2, "calls": null}', '{"version": 2, "calls": [{"startMs": 1, "ids": 3}]}', "[]"):
+            (self.state / ("launches-" + codex.hashlib.sha256(b"s").hexdigest()[:32] + ".json")).write_text(body)
+            self.assertEqual(len(self.commands([self.proc(10, 1, ["codex", "exec", "a"])])), 1)
+
+    def test_a_live_agy_process_keeps_only_its_own_conversation_listed(self):
+        call = {"atMs": self.now, "kind": "agy", "cwd": [str(self.root)], "alive": True, "via": None}
+        rows = [{"conversation_id": c, "inputAtMs": self.now + 1000, "modifiedAtMs": self.now - 600000,
+                 "parent_conversation_id": parent, "workspace_uris": json.dumps([self.root.as_uri()]), "killed": 0,
+                 "status": "CASCADE_RUN_STATUS_IDLE", "not_fully_idle": 0, "title": "t", "preview": "",
+                 "agent_name": "", "step_count": 3} for c, parent in (("c", None), ("sub", "c"))]
+        with patch.object(codex, "session_commands", lambda _: [call]):
+            self.assertEqual([a["id"] for a in agy.scan("s", rows=rows)["agents"]], ["c"])
+
+    def test_a_live_agy_process_keeps_an_idle_db_row_listed(self):
+        call = {"atMs": self.now, "kind": "agy", "cwd": [str(self.root)], "alive": True, "via": None}
+        row = {"conversation_id": "c", "inputAtMs": self.now + 1000, "modifiedAtMs": self.now - 600000,
+               "parent_conversation_id": None, "workspace_uris": json.dumps([self.root.as_uri()]), "killed": 0,
+               "status": "CASCADE_RUN_STATUS_IDLE", "not_fully_idle": 0, "title": "t", "preview": "",
+               "agent_name": "", "step_count": 3}
+        with patch.object(codex, "session_commands", lambda _: [call]):
+            self.assertEqual([a["id"] for a in agy.scan("s", rows=[row])["agents"]], ["c"])
+        with patch.object(codex, "session_commands", lambda _: [{**call, "alive": False}]):
+            self.assertEqual(agy.scan("s", rows=[row])["agents"], [])
 
 
 if __name__ == "__main__":

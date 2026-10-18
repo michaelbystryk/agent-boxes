@@ -131,13 +131,16 @@ def running(r, now_ms):
 def scan(session_id, rows=None):
     now_ms = int(time.time() * 1000)
     rows = conversations() if rows is None else rows
-    active = rows and any(running(r, now_ms) for r in rows)
-    mine = ours(rows, session_calls(session_id)) if active else {}
+    calls = session_calls(session_id) if rows else []
+    active = rows and (any(running(r, now_ms) for r in rows) or any(c.get("alive") for c in calls))
+    mine = ours(rows, calls) if active else {}
     agents = []
     for r in rows:
         call = mine.get(r["conversation_id"])
-        # headless agy leaves its DB row idle mid-run, so bench.py runs are listed from their logs below
-        if call is None or call.get("bench") or not running(r, now_ms):
+        # headless agy leaves its DB row idle mid-run: a live process says its top conversation
+        # runs (its subagents share the call), and bench.py runs are listed from their logs below
+        alive = call is not None and call.get("alive") and not r["killed"] and not r["parent_conversation_id"]
+        if call is None or call.get("bench") or not (running(r, now_ms) or alive):
             continue
         agents.append({
             "id": r["conversation_id"],

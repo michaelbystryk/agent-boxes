@@ -190,6 +190,7 @@ def main():
     import codex_scan
 
     codex_scan.prune_transcripts()
+    codex_scan.PROCESSES = True
     session_id = sys.argv[1] if len(sys.argv) > 1 else None
     scanners = {"codex": codex_box, "agy": agy_box}
     # Query both databases before either scanner asks for the shared transcripts.
@@ -197,6 +198,10 @@ def main():
     out = {name: data if isinstance(data, dict) else box(scanners[name], session_id, rows=data)
            for name, data in prepared.items()}
     out["claude"] = box(claude_box, session_id)
+    try:
+        out["unverified"] = codex_scan.unverified(session_id)
+    except Exception:
+        pass
     out["atMs"] = int(time.time() * 1000)
     sys.stdout.buffer.write(json.dumps(out, ensure_ascii=False).encode("utf-8"))
 

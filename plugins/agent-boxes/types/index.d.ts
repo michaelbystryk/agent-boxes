@@ -31,7 +31,8 @@ export type ToolBox = {
 export type Task = { id: string; subject: string; activeForm?: string | null; status: 'pending' | 'in_progress' | 'completed' }
 
 /** `claude` holds headless `claude -p` runs this chat started through bench.py; subagents come from the engine. */
-export type Scan = { codex: ToolBox; agy: ToolBox; claude?: { agents: AgentRow[]; error?: string }; atMs?: number }
+/** `unverified`: recent commands that looked like launches but parsed to nothing and have no live process. */
+export type Scan = { codex: ToolBox; agy: ToolBox; claude?: { agents: AgentRow[]; error?: string }; unverified?: number; atMs?: number }
 
 export type ClaudeBox = {
   model: string

@@ -866,6 +866,10 @@ export const register: Register = (on, given) => {
                 {a.now && <Text {...dim}>  ↳ {a.now}</Text>}
               </Box>
             ))}
+            {/* launches through loops, xargs or scripts whose run the scan could not confirm */}
+            {(s?.unverified ?? 0) > 0 && (
+              <Text {...dim}>{`${s?.unverified} ${s?.unverified === 1 ? 'command' : 'commands'} with unverified tracking`}</Text>
+            )}
           </Box>,
         )}
         {tool('codex', '֎', 'codex', OPENAI, s?.codex)}

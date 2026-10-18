@@ -144,6 +144,7 @@ def runs(session_id, agent):
             "effort": None,
             "startedAtMs": int(c["atMs"]),
             "now": next((a for a in map(act, reversed(evs)) if a), None),
+            "via": c.get("via"),
         }
         if agent == "agy":
             row["steps"] = max([codex_scan.obj(e.get("step_update")).get("step_index") or 0 for e in evs] + [0])

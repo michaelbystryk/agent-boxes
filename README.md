@@ -85,7 +85,7 @@ Each executor runs as a subagent type. Your own definition wins: `~/.claude/agen
 - Codex and agy use this plugin's relays: `agent-boxes:codex-builder`, `codex-astra`, `agy-argon`, `agy-flash` and `agy-opus`. Each is a Haiku relay that writes the brief to a file, runs `codex exec` or `agy -p`, and reports back. A relay shows in the Codex or Antigravity box, not Claude's, with Claude's `✻` in front: first as `✻ <task> · starting…`, then as its run once the scan finds it.
 - Claude's `scout`, `worker` and `architect` become `general-purpose` on Haiku, Sonnet or Opus.
 
-The relays run `codex exec -s workspace-write` and `agy -p … --dangerously-skip-permissions`, or read-only / `--mode plan` for reviews and plans. Headless `--mode plan` lets agy open no files, so the relay pastes the files the brief names into the brief. Claude Code still asks you before each launch unless your permission rules allow it.
+The relays run `codex exec -s workspace-write` and `agy -p … --sandbox --dangerously-skip-permissions`, or read-only / `--mode plan` for reviews and plans. Both sandboxes keep a run's commands to its project folder, with no network. Headless agy can't ask before a shell command: without `--dangerously-skip-permissions` it denies them all, and `--mode auto` isn't available on every account. That's why `--sandbox` is what bounds it. Headless `--mode plan` lets agy open no files, so the relay pastes the files the brief names into the brief. Claude Code still asks you before each launch unless your permission rules allow it.
 
 ### Router options
 
@@ -117,6 +117,9 @@ Claude Code's own model settings are Claude-only and blind to the task and to qu
 - **Bench runs:** `python tools/bench.py run <agent> <task>` (from llm-blender-bench) starts Claude, Codex or Antigravity headless. Codex runs pair by their bench folder like any `codex exec`. Headless Antigravity leaves its database row idle mid-run, and headless `claude -p` is no subagent of the chat, so `scripts/bench_scan.py` lists those two from the run's `agent_log.jsonl` (with a `↳` latest-action line) until it ends or bench.py records it. Claude's runs show in the Claude box.
 - **Antigravity:** found the same way, by matching `agy -p` runs to `~/.gemini/antigravity-cli/conversation_summaries.db`. Each run shows its title, model, steps and elapsed time (only Codex runs and Claude subagents get a `↳` latest-action line). Quota comes from `agy -p /usage --output-format json`, a read-only command that spends no quota and opens no window. It runs after an Antigravity run changes something (at most every 2 minutes), and otherwise once an hour.
 
+- **Runs started indirectly:** a run started through `xargs`, a loop, a variable or a script never appears as `codex exec` in the chat's commands. So the scan also reads the environment of running `codex`, `agy` and Python processes: Claude Code gives every command it runs `CLAUDE_CODE_SESSION_ID`, and the processes it starts inherit it, even after their parent shell exits. A process that names this chat counts as one of its runs, and it borrows its subagent and brief from the command that started it when there is one. Each run is remembered for 12 hours, so one that ends between two polls still counts. Process details come from the operating system with Python's standard library: `/proc` on Linux, and `libproc` and `sysctl` on macOS. On Windows the scan reads the process's own parameters, which needs 64-bit Python; it skips processes it can't open.
+- **`N commands with unverified tracking`:** in the Claude box, this counts commands from the last 15 minutes that look like they start a run, that the scan can't read, and that no process has turned up for yet. Their runs may be missing from the boxes.
+
 Everything runs on your own machine. Nothing is sent anywhere except the summary call above.
 
 ## Troubleshooting
@@ -124,8 +127,8 @@ Everything runs on your own machine. Nothing is sent anywhere except the summary
 - **No side bar:** check the fullscreen TUI and terminal width (above). It opens by itself from 144 columns, and from 110 once you've opened it with `/agent-boxes`.
 - **"needs Python 3.8+" / Python 2 / macOS `python3` asks for developer tools:** install Python 3 from [python.org](https://www.python.org) or Homebrew, or set the `python` option (see [Options](#options)) to a working Python 3.8+ interpreter.
 - **Codex quota shows `–`:** stays `–` until Codex has logged at least one run in the last 7 days.
-- **Codex runs don't show up:** only runs this chat started with `codex exec` are listed, and only for 12 hours after they start.
-- **Antigravity quota shows `–`:** `agy` must be on `PATH` (on Windows, the default `%LOCALAPPDATA%gyingy.exe` also works) and signed in. The first reading takes a few seconds.
+- **Codex runs don't show up:** only runs this chat started with `codex exec` are listed, and only for 12 hours after they start. Runs started through `xargs` or a script are found from their processes while they run (see [How it works](#how-it-works)).
+- **Antigravity quota shows `–`:** `agy` must be on `PATH` (on Windows, the default `%LOCALAPPDATA%\agy\bin\agy.exe` also works) and signed in. The first reading takes a few seconds.
 - **`scan slow` hint:** the 5-second background scan took longer than usual (for example, while reading large session logs or waiting on disk). It keeps the previous reading and catches up on the next poll.
 - **State and cache files:** stored in `~/.claude/agent-boxes/` (or `$CLAUDE_CONFIG_DIR/agent-boxes/`). Delete that folder to clear cached Antigravity quota readings. `router-history.jsonl` there records each routed spawn (category, the suggestion, what ran) and how long it took, capped at 1000 lines; the router doesn't learn from it yet.
 - **Uninstall:** run `/plugin uninstall agent-boxes` in Claude Code, or `claude plugin uninstall agent-boxes@agent-boxes` from your shell.

@@ -237,6 +237,20 @@ test("the claude box lists the chat's headless bench runs", async ($, on) => {
   await ui.unmount()
 })
 
+test('launches the scan could not confirm are counted in the claude box', async ($, on) => {
+  await start($, on, { scan: { ...SCAN, unverified: 2 } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^2 commands with unverified tracking$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('no unverified line when every launch is tracked', async ($, on) => {
+  await start($, on, { scan: { ...SCAN, unverified: 0 } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /unverified tracking/ })).toBeUndefined()
+  await ui.unmount()
+})
+
 // Two relays: Codex's run is under way, agy's has not shown up in the scan yet.
 const RELAYS: Setup = {
   agents: [

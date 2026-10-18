@@ -38,11 +38,15 @@ LIFECYCLE = ("task_started", "task_complete", "turn_aborted")
 CLAUDE_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
 CLAUDE_PROJECTS = os.path.join(CLAUDE_HOME, "projects")
 SHELL_TOOLS = ("Bash", "PowerShell")
+UNVERIFIED_MS = 15 * 60 * 1000
+# Find this chat's runs among live processes too (boxes.py turns it on; tests opt in).
+PROCESSES = False
+_LAUNCHES = {}
 STATE = os.path.join(CLAUDE_HOME, "agent-boxes")
 _TRANSCRIPTS = {}
 _COMMANDS = {}
 _READ_BUDGET = None
-CACHE_VERSION = 5
+CACHE_VERSION = 7
 TRANSCRIPT_BYTES = 64 * 1024 * 1024
 TRANSCRIPT_SECONDS = 2
 RECORD_BYTES = 4 * 1024 * 1024
@@ -302,7 +306,11 @@ def extract_calls(raw, data, since_ms):
         command = inp.get("command")
         if (block.get("type") == "tool_use" and block.get("name") in SHELL_TOOLS
                 and isinstance(command, str) and any(k in command for k in ("codex", "agy", "bench.py"))):
-            data["calls"].extend(parsed_calls(at_ms, command, inp.get("cwd") or ev.get("cwd")))
+            calls = parsed_calls(at_ms, command, inp.get("cwd") or ev.get("cwd"))
+            data["calls"].extend(calls)
+            kind = None if calls else looks_like_launch(command)
+            if kind:
+                data.setdefault("unverified", []).append([at_ms, kind])
 
 
 def save_transcript(cache, data):
@@ -327,7 +335,7 @@ def prune_transcripts():
     except OSError:
         return
     for name in names:
-        if name.endswith(".tmp") or name.startswith("transcript-") and name.endswith(".json"):
+        if name.endswith(".tmp") or name.startswith(("transcript-", "launches-")) and name.endswith(".json"):
             path = os.path.join(STATE, name)
             try:
                 expiry = time.time() - 3600 if name.endswith(".tmp") else cutoff
@@ -349,7 +357,9 @@ def transcript_data(path, since_ms):
     rebuilt = not data
     data["calls"] = [c for c in data.get("calls", []) if isinstance(c, dict)
                      and isinstance(c.get("atMs"), (int, float)) and c["atMs"] >= since_ms
-                     and c.get("kind") in ("codex", "agy")]
+                     and c.get("kind") in ("codex", "agy", "bench")]
+    data["unverified"] = [u for u in data.get("unverified", []) if isinstance(u, list) and len(u) == 2
+                          and isinstance(u[0], (int, float)) and u[0] >= since_ms and u[1] in ("codex", "agy", "bench")]
     offset = data.get("offset", 0)
     start = data.get("skipOffset", offset)
     cursor, skipping = start, start > offset
@@ -389,13 +399,14 @@ def transcript_data(path, since_ms):
     return data
 
 
-def transcripts(session_id):
+def transcripts(session_id, ids=None):
     """The session's transcripts and its subagents', whichever project holds them.
 
     A session that ran out of context goes on writing under a new id, while
-    the engine still reports the first: follow the `continued-in` chain.
+    the engine still reports the first: follow the `continued-in` chain. Each id
+    on it goes into `ids`.
     """
-    paths, seen = [], set()
+    paths, seen = [], set() if ids is None else ids
     since = time.time() * 1000 - LOOKBACK_MS
     while re.fullmatch(r"[\w-]+", session_id or "") and session_id not in seen:
         seen.add(session_id)
@@ -426,19 +437,240 @@ def via(path):
 
 def session_commands(session_id):
     """One shared pass for both scanners, including session continuations. Each call carries
-    `via`: the subagent that ran it, or None for the chat itself."""
+    `via`: the subagent that ran it, or None for the chat itself. Runs found as live processes
+    join them, merged with the command that started them."""
     key = (CLAUDE_PROJECTS, session_id)
     if key not in _COMMANDS:
         since = time.time() * 1000 - LOOKBACK_MS
-        _COMMANDS[key] = [{**c, "via": via(path)} for path in transcripts(session_id)
-                          for c in transcript_data(path, since)["calls"] if c["atMs"] >= since]
+        ids, calls, unparsed = set(), [], []
+        for path in transcripts(session_id, ids):
+            data = transcript_data(path, since)
+            calls += [{**c, "via": via(path)} for c in data["calls"] if c["atMs"] >= since]
+            unparsed += [(at, kind, via(path)) for at, kind in data.get("unverified", [])]
+        launches = remembered(session_id, live_launches(ids | {session_id}) if PROCESSES else None, since)
+        _COMMANDS[key] = merge_launches(calls, launches, unparsed)
+        _LAUNCHES[key] = (launches, unparsed)
     return _COMMANDS[key]
+
+
+def unverified(session_id):
+    """How many recent commands looked like launches, parsed to nothing, and have no process
+    of their kind to show for them: their runs may be missing from the boxes."""
+    now = time.time() * 1000
+    session_commands(session_id)
+    launches, unparsed = _LAUNCHES.get((CLAUDE_PROJECTS, session_id), ([], []))
+    starts = [(c["kind"], c["startMs"]) for c in launches]
+    return sum(1 for at, kind, _ in unparsed if at >= now - UNVERIFIED_MS
+               and not any(k == kind and at - 2000 <= t <= at + MATCH_AFTER_MS for k, t in starts))
+
+
+def launch_argv(argv):
+    """A process's argv as the command that started it: `node .../codex.js` and codex's
+    platform binaries as `codex`, any python or py launcher as `python`; [] for anything else."""
+    words = [w for w in argv if isinstance(w, str)]
+
+    def base(w):
+        return re.sub(r"\.(exe|cmd|js|mjs)$", "", re.split(r"[\\/]", w)[-1].lower())
+
+    if len(words) >= 2 and base(words[0]) in ("node", "bun"):
+        script = words[1].lower().replace("\\", "/")
+        name = next((n for n in ("codex", "agy") if f"/{n}/" in script or base(words[1]) == n), None)
+        if not name:
+            return []
+        words = [name] + words[2:]
+    if not words:
+        return []
+    name = base(words[0])
+    if name.startswith("codex"):
+        name = "codex"
+    elif re.fullmatch(r"python[\d.]*w?|pyw?", name):
+        name = "python"
+    elif name != "agy":
+        return []
+    return [name] + words[1:]
+
+
+def argv_calls(at_ms, argv, cwd):
+    """The calls a live process makes, from its real argv and working directory."""
+    words = launch_argv(argv)
+    if not words:
+        return []
+    # single-quoted, so parsed_calls takes every word literally
+    command = " ".join("'" + w.replace("'", "'\"'\"'") + "'" for w in words)
+    out = []
+    for c in parsed_calls(at_ms, command, cwd):
+        if c["kind"] == "codex":
+            if c.get("prompt") == "-":  # the brief came on stdin
+                c.pop("prompt")
+            # codex may already run in its -C dir, so a relative -C would be applied twice
+            if c.get("cwd") and not os.path.isdir(c["cwd"]) and cwd and os.path.isdir(cwd):
+                c["cwd"] = cwd
+        out.append(c)
+    return out
+
+
+def live_launches(session_ids):
+    """Calls for this chat's live processes, one per launch, or None when processes can't be read.
+    A launcher (node codex.js, py) and the process it starts are one launch; so are a bench run
+    and the agent CLI it starts. `ids` holds every (pid, start) of the launch, so a later poll
+    that sees only one of them still knows it."""
+    try:
+        import procs
+
+        found, tree = procs.launches(session_ids)
+    except Exception:
+        return None
+    calls = {}
+    for p in found:
+        got = argv_calls(p.startMs, p.argv, p.cwd)
+        if got:
+            calls[p.pid] = (p, got[0])
+    into = {}
+    for pid, (p, call) in calls.items():
+        anc, hops = p.ppid, 0
+        while anc in tree and anc != pid and hops < 64 and pid not in into:
+            if anc in calls:
+                q, parent = calls[anc]
+                if q.startMs <= p.startMs + 2000 and (
+                        parent["kind"] == "bench"
+                        or anc == p.ppid and parent["kind"] == call["kind"]
+                        and launch_argv(q.argv)[1:] == launch_argv(p.argv)[1:]):
+                    into[pid] = anc
+            anc, hops = tree[anc].ppid, hops + 1
+    out = {}
+    for pid, (p, call) in calls.items():
+        root, hops = pid, 0
+        while root in into and hops < 64:
+            root, hops = into[root], hops + 1
+        q, root_call = calls[root]
+        launch = out.setdefault(root, {**root_call, "atMs": q.startMs, "startMs": q.startMs, "ids": [], "alive": True})
+        launch["ids"].append([pid, p.startMs])
+    return list(out.values())
+
+
+def remembered(session_id, live, since):
+    """Launches seen in earlier polls plus the live ones, kept per chat so a run that ended
+    between polls still counts (pairing needs every call of a burst). A live launch that shares
+    a (pid, start) with a remembered one is the same launch."""
+    path = os.path.join(STATE, "launches-" + hashlib.sha256((session_id or "").encode()).hexdigest()[:32] + ".json")
+    old = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("version") == 2 and isinstance(data.get("calls"), list):
+            old = [c for c in data["calls"] if isinstance(c, dict) and isinstance(c.get("startMs"), (int, float))
+                   and c["startMs"] >= since and c.get("kind") in ("codex", "agy", "bench")
+                   and isinstance(c.get("ids"), list) and all(isinstance(i, list) and len(i) == 2 for i in c["ids"])]
+    except (OSError, ValueError):
+        pass
+    if not live:
+        return old
+    merged = [dict(c) for c in old]
+    for launch in live:
+        ids = {tuple(i) for i in launch["ids"]}
+        same = next((c for c in merged if ids & {tuple(i) for i in c["ids"]}), None)
+        if same is None:
+            merged.append(launch)
+            continue
+        start = min(same["startMs"], launch["startMs"])
+        same.update({**launch, "atMs": start, "startMs": start,
+                     "ids": [list(i) for i in sorted(ids | {tuple(i) for i in same["ids"]})]})
+    keep = [{k: v for k, v in c.items() if k != "alive"} for c in merged]
+    if keep != old:
+        tmp = path + ".%s.tmp" % os.getpid()
+        try:
+            os.makedirs(STATE, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"version": 2, "calls": keep}, f)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return merged
+
+
+def same_launch(c, p):
+    """Whether transcript call `c` started process launch `p`."""
+    if c["kind"] != p["kind"] or not p["startMs"] - MATCH_AFTER_MS <= c["atMs"] <= p["startMs"] + 2000:
+        return False
+    if c["kind"] == "bench":
+        return (c["agent"], c["task"], bool(c.get("control"))) == (p["agent"], p["task"], bool(p.get("control"))) \
+            and norm_path(c.get("repo")) == norm_path(p.get("repo"))
+    pa, pb = prompts(c), prompts(p)
+    if pa and pb and not any(same_prompt(x, y) for x in pa for y in pb):
+        return False
+    if c["kind"] == "agy":
+        a = {norm_path(x) for x in c.get("cwd") or []} - {None}
+        b = {norm_path(x) for x in p.get("cwd") or []} - {None}
+        return not a or not b or bool(a & b)
+    a, b = norm_path(c.get("cwd")), norm_path(p.get("cwd"))
+    return not a or not b or a == b
+
+
+def merge_launches(calls, launches, unparsed=()):
+    """Transcript calls and process launches. A launch takes the time (so bursts pair as before),
+    subagent (`via`) and missing fields of the command that started it. Commands and launches
+    that could match each other form a group: an even group pairs in time order, like
+    pair_calls; in an uneven one each launch takes the latest free command, and `via` only when
+    the group's commands agree on it. A launch no parsed command explains takes the subagent of
+    the unparsed launch commands (xargs, loops) just before it, when they agree."""
+    launches = sorted(launches, key=lambda c: c["startMs"])
+    edges = [[i for i, c in enumerate(calls) if same_launch(c, p)] for p in launches]
+    group = {}  # union-find over ("p", i) and ("c", j)
+
+    def find(x):
+        while group.get(x, x) != x:
+            x = group[x]
+        return x
+
+    for k, e in enumerate(edges):
+        for i in e:
+            group[find(("c", i))] = find(("p", k))
+    members = {}
+    for k, e in enumerate(edges):
+        if e:
+            members.setdefault(find(("p", k)), ([], set()))[0].append(k)
+            members[find(("p", k))][1].update(e)
+    pair, vias, used = {}, {}, set()
+    for ks, cs in members.values():
+        cs = sorted(cs, key=lambda i: calls[i]["atMs"])
+        if len(ks) == len(cs) and all(i in edges[k] for k, i in zip(ks, cs)):
+            pair.update(zip(ks, cs))
+            vias.update((k, calls[i].get("via")) for k, i in zip(ks, cs))
+            continue
+        agreed = {calls[i].get("via") for i in cs}
+        for k in ks:
+            free = [i for i in edges[k] if i not in used]
+            if free:
+                pair[k] = max(free, key=lambda i: calls[i]["atMs"])
+                used.add(pair[k])
+            vias[k] = agreed.pop() if len(agreed) == 1 else None
+    used = set(pair.values())
+    out = []
+    for k, p in enumerate(launches):
+        merged = dict(p)
+        if k in pair:
+            c = calls[pair[k]]
+            merged["atMs"] = c["atMs"]
+            for f in ("brief", "prompt", "cwd", "model", "effort"):
+                if c.get(f) and not merged.get(f):
+                    merged[f] = c[f]
+        if edges[k]:
+            merged["via"] = vias.get(k)
+        else:
+            found = {v for at, kind, v in unparsed
+                     if kind == p["kind"] and p["startMs"] - MATCH_AFTER_MS <= at <= p["startMs"] + 2000}
+            merged["via"] = found.pop() if len(found) == 1 else None
+        out.append(merged)
+    return [c for i, c in enumerate(calls) if i not in used] + out
 
 
 def session_calls(session_id):
     """The session's `codex exec` calls: when, the -C dir, and the brief fed on stdin.
     A bench.py launch counts as a call with only its bench dir."""
-    return [c if c["kind"] == "codex" else {"atMs": c["atMs"], "kind": "codex", "cwd": c["cwd"], "via": None}
+    return [c if c["kind"] == "codex" else {"atMs": c["atMs"], "kind": "codex", "cwd": c["cwd"], "via": c.get("via")}
             for c in session_commands(session_id)
             if c["kind"] == "codex" or (c["kind"] == "bench" and c["agent"] == "codex")]
 
@@ -592,6 +824,31 @@ def exec_args(words, env, call):
         call["prompt"] = norm_text(" ".join(positional))
 
 
+def looks_like_launch(command, depth=0):
+    """The kind of run a command starts somewhere in its words ("codex", "agy", "bench"), even
+    where parsed_calls can't follow it (`xargs codex exec`, `for t in ...; do agy -p "$t"`,
+    `sh -c '...'`), or None. Text that only mentions one, in quotes or a heredoc, is a single
+    word and doesn't count."""
+    for seg in shell_segments(command):
+        words = seg["words"]
+        for i, w in enumerate(words):
+            name = re.sub(r"\.(exe|cmd)$", "", re.split(r"[\\/]", w)[-1].lower())
+            if name == "codex" and "exec" in words[i + 1:]:
+                return "codex"
+            if name == "agy" and any(r in ("-p", "--print", "--prompt") or r.startswith(("--print=", "--prompt="))
+                                     for r in words[i + 1:]):
+                return "agy"
+            if re.fullmatch(r"python[\d.]*w?|pyw?", name):
+                for j in range(i + 1, len(words) - 1):
+                    if re.split(r"[\\/]", words[j])[-1] == "bench.py" and words[j + 1] == "run":
+                        return "bench"
+            if depth < 3 and i and words[i - 1].lower() in ("-c", "-command", "/c") and re.search(r"\s", w):
+                kind = looks_like_launch(w, depth + 1)
+                if kind:
+                    return kind
+    return None
+
+
 def parsed_calls(at_ms, command, cwd=None):
     """Persist only matching fields; never keep the original shell command."""
     out, env, previous = [], {}, []
@@ -617,7 +874,7 @@ def parsed_calls(at_ms, command, cwd=None):
             args = [w for w in words[1:] if w.lower() not in ("-path", "-literalpath")]
             if args:
                 cwd = resolve_path(expand(args[0], env), cwd)
-        elif name in ("python", "python3", "py"):
+        elif re.fullmatch(r"python[\d.]*w?|pyw?", name):
             # llm-blender-bench: `python tools/bench.py run <agent> <task>` starts that agent's CLI
             # headless, working in <repo>/benches/<agent>/<task> (<task>_noguide for --no-guide control runs)
             args = [w for w in words[1:] if not w.startswith("-")]
