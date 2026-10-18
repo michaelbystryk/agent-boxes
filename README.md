@@ -45,14 +45,6 @@ To update later, run `claude plugin update agent-boxes@agent-boxes`, then `/relo
 | **A terminal at least 144 columns wide** | The side bar opens by itself from 144 columns, and from 110 once you've opened it with `/agent-boxes`. |
 | **Python 3.8+** on `PATH` | Needed only for the Codex and Antigravity boxes. The Claude, Now and Next boxes work without it. |
 | **Codex / Antigravity** | Optional. Each tool's box appears only when the tool is installed (`~/.codex` or `$CODEX_HOME`, `~/.gemini/antigravity-cli`). |
-| **`pyte`** (plus **`pywinpty`** on Windows) | Optional, for Antigravity's quota meters. Antigravity shows its quota only in its interactive `/usage` screen, so agent-boxes opens Antigravity in a hidden terminal every 10 minutes to read it. |
-
-Install the Antigravity quota packages into the **same Python** that agent-boxes uses:
-
-- **macOS / Linux:** `python3 -m pip install --user pyte`
-- **Windows:** `py -m pip install pyte pywinpty` (or `python -m pip install pyte pywinpty`)
-- If you set the **Python command** option, run `<that-python> -m pip install ...` instead.
-- If `pip` says `externally-managed-environment` (PEP 668), run `python3 -m pip install --user --break-system-packages pyte`, or create a venv, install `pyte` there, and set **Python command** to that venv's `python`.
 
 ## Options
 
@@ -72,7 +64,7 @@ Run `/config` and find **agent-boxes**:
 - **Now:** reads the chat's task list from `~/.claude/tasks/<session>/` (`$CLAUDE_CONFIG_DIR` is respected across all `~/.claude` paths). With no task list, the summary model fills it in.
 - **Next** and the `⏳ waiting on you` marker: one short call to the summary model after each main turn. It sends your latest request, Claude's reply (trimmed to a few thousand characters) and the task list. The call runs on your own Claude account like any other request.
 - **Codex:** `scripts/boxes.py` polls every 5 seconds. It finds the `codex exec` runs this chat started by matching the chat's shell commands to Codex's local thread database in `~/.codex` (or `$CODEX_HOME`). Each run's `↳` line is the last item in its rollout log: a command, an edit or a message. Quota comes from the rate limits Codex logs.
-- **Antigravity:** found the same way, by matching `agy -p` runs to `~/.gemini/antigravity-cli/conversation_summaries.db`. Each run shows its title, model, steps and elapsed time (only Codex runs and Claude subagents get a `↳` latest-action line).
+- **Antigravity:** found the same way, by matching `agy -p` runs to `~/.gemini/antigravity-cli/conversation_summaries.db`. Each run shows its title, model, steps and elapsed time (only Codex runs and Claude subagents get a `↳` latest-action line). Quota comes from `agy -p /usage --output-format json`, a read-only command that spends no quota and opens no window. It runs after an Antigravity run changes something (at most every 2 minutes), and otherwise once an hour.
 
 Everything runs on your own machine. Nothing is sent anywhere except the summary call above.
 
@@ -82,7 +74,7 @@ Everything runs on your own machine. Nothing is sent anywhere except the summary
 - **"needs Python 3.8+" / Python 2 / macOS `python3` asks for developer tools:** install Python 3 from [python.org](https://www.python.org) or Homebrew, or set the **Python command** option to a working Python 3.8+ interpreter.
 - **Codex quota shows `–`:** stays `–` until Codex has logged at least one run in the last 7 days.
 - **Codex runs don't show up:** only runs this chat started with `codex exec` are listed, and only for 12 hours after they start.
-- **Antigravity quota shows `–`:** install `pyte` (plus `pywinpty` on Windows) into the Python interpreter agent-boxes uses (see above). The first reading takes up to a minute.
+- **Antigravity quota shows `–`:** `agy` must be on `PATH` (on Windows, the default `%LOCALAPPDATA%gyingy.exe` also works) and signed in. The first reading takes a few seconds.
 - **`scan slow` hint:** the 5-second background scan took longer than usual (for example, while reading large session logs or waiting on disk). It keeps the previous reading and catches up on the next poll.
 - **State and cache files:** stored in `~/.claude/agent-boxes/` (or `$CLAUDE_CONFIG_DIR/agent-boxes/`). Delete that folder to clear cached Antigravity quota readings.
 - **Uninstall:** run `/plugin uninstall agent-boxes` in Claude Code, or `claude plugin uninstall agent-boxes@agent-boxes` from your shell.

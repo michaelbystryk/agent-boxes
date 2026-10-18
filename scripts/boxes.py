@@ -120,9 +120,11 @@ def agy_box(session_id, rows=None, prepare=False):
         return agy_scan.conversations()
     import agy_usage
 
+    if rows is None:
+        rows = agy_scan.conversations()
     scan = agy_scan.scan(session_id, rows=rows)
     now = scan["nowMs"]
-    usage = agy_usage.cached() or {}
+    usage = agy_usage.cached(max((r.get("modifiedAtMs") or 0 for r in rows), default=0)) or {}
     groups = usage.get("groups") or {}
 
     def window(g, key):
@@ -144,8 +146,8 @@ def agy_box(session_id, rows=None, prepare=False):
         "fiveHour": window_used(window(gemini, "5h"), now),
         "sevenDay": window_used(window(gemini, "7d"), now),
     }
-    if not groups and not agy_usage.can_scrape():
-        box["hint"] = "quota needs: pip install pyte" + (" pywinpty" if os.name == "nt" else "")
+    if not groups and not agy_usage.AGY:
+        box["hint"] = "quota needs agy on PATH"
     if groups:
         at = usage.get("lastSuccessAtMs", usage.get("atMs", 0) if not usage.get("failedAtMs") else 0)
         if not at:

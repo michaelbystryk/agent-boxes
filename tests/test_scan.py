@@ -321,11 +321,43 @@ class UsageTests(Files):
         self.assertIsNone(usage.take_lock())
         usage.unlock(second)
 
-    def test_drop_empty_windows(self):
-        self.assertEqual(usage.parse(["GEMINI MODELS", "Weekly Limit", "Refreshes in 2h"], 0), {})
-        result = usage.parse(["GEMINI MODELS", "Weekly Limit", "Five Hour Limit", "[###] 75%",
-                              "CLAUDE/GPT MODELS", "[###] 90%", "Weekly Limit"], 0)
-        self.assertEqual(result, {"gemini": {"5h": {"used": 25}}})
+    def test_parse_usage_json(self):
+        data = {"groups": [
+            {"name": "Gemini Models", "buckets": [
+                {"window": "weekly", "remaining_fraction": 0.75, "reset_time": "2026-10-24T00:00:00Z"},
+                {"window": "5h", "remaining_fraction": 1, "reset_time": "2026-10-18T11:30:00Z"}]},
+            {"name": "Claude and GPT models", "buckets": [{"window": "5h", "remaining_fraction": True}]},
+            {"name": "Other Models", "buckets": [{"window": "daily", "remaining_fraction": 0.5}]},
+        ]}
+        # an untouched window's rolling reset time is dropped; bad buckets and empty groups too
+        self.assertEqual(usage.parse(data), {"gemini": {"7d": {"used": 25, "resetsAt": 1792800000.0},
+                                                         "5h": {"used": 0}}})
+        self.assertEqual(usage.parse(None), {})
+
+    def test_refresh_reads_print_mode_json(self):
+        out = json.dumps({"command": {"name": "usage", "data": {"groups": [
+            {"name": "Gemini Models", "buckets": [{"window": "5h", "remaining_fraction": 0.5}]}]}}})
+        done = type("Done", (), {"stdout": out})()
+        with patch.object(usage, "AGY", "agy"), patch.object(usage.subprocess, "run", return_value=done) as run:
+            usage.refresh()
+        self.assertEqual(run.call_args[0][0], ["agy", "-p", "/usage", "--output-format", "json"])
+        self.assertEqual(usage.read_cache()["groups"], {"gemini": {"5h": {"used": 50}}})
+
+    def test_refresh_waits_for_agy_activity(self):
+        now = time.time() * 1000
+        recent = {"lastAttemptAtMs": now - 5 * 60000}
+        self.assertFalse(usage.stale(recent))
+        self.assertFalse(usage.stale(recent, now - 6 * 60000))  # nothing ran since the attempt
+        self.assertTrue(usage.stale(recent, now - 60000))
+        self.assertFalse(usage.stale({"lastAttemptAtMs": now - 60000}, now))  # at most every MIN_S
+        self.assertTrue(usage.stale({"lastAttemptAtMs": now - 61 * 60000}))
+        self.assertTrue(usage.stale(None))
+
+    def test_windows_refresh_has_no_window(self):
+        with patch.object(os, "name", "nt"):
+            flags = runpy.run_path(usage.__file__)["DETACH"]["creationflags"]
+        self.assertTrue(flags & 0x08000000)  # CREATE_NO_WINDOW
+        self.assertFalse(flags & 0x00000008)  # DETACHED_PROCESS would cancel it
 
     def test_failure_preserves_success_timestamp(self):
         with patch.object(usage.time, "time", return_value=100):
@@ -337,10 +369,10 @@ class UsageTests(Files):
 
     def test_stale_quota_hint(self):
         now = int(time.time() * 1000)
-        data = {"lastSuccessAtMs": now - 34 * 60000, "groups": {"gemini": {"5h": {"used": 20}}}}
+        data = {"lastSuccessAtMs": now - 150 * 60000, "groups": {"gemini": {"5h": {"used": 20}}}}
         with patch.object(agy, "HOME", str(self.root)), patch.object(agy, "scan", return_value={"nowMs": now, "agents": []}), \
                 patch.object(usage, "cached", return_value=data):
-            self.assertEqual(boxes.agy_box("session")["hint"], "quota from 34m ago")
+            self.assertEqual(boxes.agy_box("session")["hint"], "quota from 2h30m ago")
 
     def test_localappdata_fallback_is_windows_only(self):
         for platform, env, expected in (("posix", {"LOCALAPPDATA": "fake"}, None), ("nt", {}, None),
@@ -348,18 +380,6 @@ class UsageTests(Files):
             with patch.object(os, "name", platform), patch.dict(os.environ, env, clear=True), \
                     patch.object(usage.shutil, "which", return_value=None):
                 self.assertEqual(runpy.run_path(usage.__file__)["AGY"], expected)
-
-    def test_pty_kills_and_reaps_before_close(self):
-        p = usage.PosixPty.__new__(usage.PosixPty)
-        p.pid, p.fd = 123, 456
-        order = []
-        with patch.object(signal, "SIGKILL", 9, create=True), \
-                patch.object(os, "killpg", side_effect=lambda *a: order.append("kill"), create=True), \
-                patch.object(os, "waitpid", side_effect=lambda *a: order.append("reap")), \
-                patch.object(os, "close", side_effect=lambda *a: order.append("close")):
-            p.terminate(force=True)
-        self.assertEqual(order, ["kill", "reap", "close"])
-
 
 
 class BornTests(unittest.TestCase):
