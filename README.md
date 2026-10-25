@@ -79,7 +79,12 @@ When you have Claude, Codex and Antigravity (`agy`) all at once, the router deci
    - **Use it or lose it:** a 7-day window that resets soon with a lot unused earns a bonus. One used ahead of the clock gets a penalty.
    - Big tasks weigh quota more. Small tasks lean toward cheap executors.
    - When Claude is short, Opus and Sonnet places go to **Opus via agy**, the same model on Google's quota.
-3. **Tells Claude**, in a hidden note on the prompt (press ctrl+o to see it), for example: `Suggested executor: Gemini 4 Argon, via subagent_type "agent-boxes:agy-argon". Why: best fit for hard bug fix. Fallback: Sonnet 5.5…`. A fixed routing policy in the system prompt explains the roster and the rules: delegate substantive work, do quick steps yourself, a reviewer is never the builder, and a model you name yourself always wins.
+3. **Tells Claude**, in a hidden note on the prompt (press ctrl+o to see it), for example: `Suggested executor: Gemini 4 Argon, via subagent_type "agent-boxes:agy-argon". Why: best fit for hard bug fix. Fallback: Sonnet 5.5…`. A fixed routing policy in the system prompt explains the roster and the rules:
+   - Work picked for Codex or agy is delegated, since that spends quota outside Claude.
+   - Work picked for a Claude model stays in the main loop while Claude has room. Another Claude subagent would spend the same quota and hand back only a summary (the note says `do it in this loop`). Parallel work, reviews and broad read-only sweeps still go to subagents.
+   - Near Claude's limit, all substantive work is delegated.
+   - A relay's report ends with the path of its full output, which Claude reads before building on the result.
+   - A reviewer is never the builder, and a model you name yourself always wins.
 
 The `⇄ router` box at the bottom of the side bar shows the mode in its title. Before any routed prompt, it shows the pool best placed right now (`agy best placed · 97% free · 8 ready`). After one, it shows the pick, the category, the reason and the fallback. It drops to one line when the side bar is short.
 

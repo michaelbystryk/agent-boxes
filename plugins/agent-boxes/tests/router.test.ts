@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { EXECUTORS } from '../hooks/catalog'
-import { DEFAULTS, categoryById, classify, poolState, readConfig, roster, route, sizeOf } from '../hooks/route'
+import { DEFAULTS, categoryById, classify, contextNote, policy, poolState, readConfig, roster, route, sizeOf } from '../hooks/route'
 import type { Quota } from '../hooks/route'
 
 const NOW = Date.UTC(2026, 9, 18, 12)
@@ -81,4 +81,23 @@ test('every catalog rank names an executor', () => {
   for (const id of ['lookup', 'blender', 'shader', 'gamedev', 'art', 'review', 'bugfix', 'frontend', 'terminal', 'design', 'research', 'refactor', 'build', 'general']) {
     for (const x of categoryById(id).ranked) expect(known.has(x)).toBe(true)
   }
+})
+
+test('a Claude pick with room stays in the loop; an outside pick is delegated', () => {
+  const quota: Quota = { claude: { '5h': { used: 20 }, '7d': { used: 30 } }, codex: { '7d': { used: 30 } } }
+  const own = route(categoryById('shader'), 'medium', quota, NOW, all)
+  expect(own.pick?.pool).toBe('claude')
+  expect(contextNote(own, quota, NOW)).toMatch(/do it in this loop/)
+  const low: Quota = { ...quota, claude: { '5h': { used: 92 }, '7d': { used: 40 } } }
+  const out = route(categoryById('shader'), 'medium', low, NOW, all)
+  expect(out.pick?.pool).not.toBe('claude')
+  expect(contextNote(out, low, NOW)).not.toMatch(/do it in this loop/)
+  expect(contextNote(out, low, NOW)).toMatch(/delegate substantive work/)
+})
+
+test('the policy delegates outside quota and keeps Claude work in the loop', () => {
+  const text = policy(all)
+  expect(text).toMatch(/Codex or agy, delegate substantive work/)
+  expect(text).toMatch(/runs on Claude and Claude has room, do the work in this loop/)
+  expect(text).toMatch(/Full output|full output file/)
 })

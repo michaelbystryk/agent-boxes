@@ -223,6 +223,8 @@ export function contextNote(r: Route, quota: Quota, now: number) {
   lines.push(`Quota: ${quotaLine(quota, now)}.`)
   if (r.isClaudeLow) {
     lines.push('Claude is near its limit: delegate substantive work to the suggestion and keep your own turns short.')
+  } else if (r.pick.pool === 'claude') {
+    lines.push("The pick is on Claude's own quota: do it in this loop unless it is parallel work, a review or a broad read-only sweep.")
   }
   return lines.join('\n')
 }
@@ -234,7 +236,11 @@ export function policy(executors: Executor[]) {
     '# Model routing (agent-boxes router)',
     'Work is spread over three subscriptions: Claude, OpenAI Codex and Google Antigravity (agy). Each user prompt may carry a [router] note naming the executor best suited to it, picked from benchmark fit and live quota.',
     'Rules:',
-    '- Do quick, trivial steps yourself. Delegate substantive work to the suggested executor through the Agent tool.',
+    '- Do quick, trivial steps yourself.',
+    '- When the suggestion runs on Codex or agy, delegate substantive work to it through the Agent tool: that spends quota outside Claude.',
+    '- When the suggestion runs on Claude and Claude has room, do the work in this loop: another Claude subagent spends the same quota and hands back only a summary. Still delegate parallel work on disjoint paths, reviews and broad read-only sweeps.',
+    '- When Claude is near its limit, delegate all substantive work to the suggestion.',
+    "- A Codex or agy relay's report ends with the path of its full output file. Read that file before building on the result: the report is a summary.",
     '- If the user named a model or agent, use theirs and ignore the suggestion.',
     '- A reviewer must not be the agent that built the work; prefer one on another subscription.',
     '- If an executor fails or is rate-limited twice, move to the fallback.',
