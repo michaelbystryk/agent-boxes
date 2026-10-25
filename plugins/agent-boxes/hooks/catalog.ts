@@ -5,6 +5,8 @@
 export type Pool = 'claude' | 'codex' | 'agy' | 'agy-claude'
 
 export type Executor = {
+  /** Set by the router: the agent is the user's or the project's own definition. */
+  isCustom?: boolean
   id: string
   /** The Agent tool's subagent_type that runs it. */
   agent: string

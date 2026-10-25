@@ -8,6 +8,7 @@ import {
   refresh as refreshRouter,
   routeCommand,
   routeNote,
+  turnDone,
   routingPolicy,
   spawnedAgent,
   startRouter,
@@ -591,6 +592,7 @@ export const register: Register = (on, given) => {
     if (e.agentId === undefined) {
       turnGen++
       void briefing($, turnGen)
+      await turnDone($).catch(() => undefined)
     }
     await agentDone($, e.agentId).catch(() => undefined)
 
@@ -631,7 +633,7 @@ export const register: Register = (on, given) => {
     return done
   })
 
-  on('command.run', { command: 'route' }, async $ => ({ text: await routeCommand($) }))
+  on('command.run', { command: 'route' }, async ($, e) => ({ text: await routeCommand($, e.args) }))
 
   on('command.run', { command: 'agent-boxes' }, async $ => {
     await $.ui.open({ id: PANE, title: 'Agents', columns: config.width })
