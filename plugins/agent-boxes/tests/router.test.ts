@@ -6,6 +6,7 @@ import {
   categoryById,
   classify,
   contextNote,
+  namedIn,
   outcomeOf,
   placement,
   policy,
@@ -117,6 +118,32 @@ test('a Claude pick on this chat\'s own model stays in the loop, with one instru
   expect(note).not.toMatch(/Suggested executor/)
 })
 
+test("a pick that is the user's own agent definition goes to that agent, unless inLoop is 'all'", () => {
+  const mine = all.map(x => (x.id === 'opus' ? { ...x, isCustom: true } : x))
+  const r = route(categoryById('shader'), 'medium', ROOM, NOW, mine, DEFAULTS)
+  expect(r.pick?.id).toBe('opus')
+  expect(placement(r, ROOM, OPUS, DEFAULTS)).toMatchObject({
+    inLoop: false,
+    reason: expect.stringMatching(/your own architect definition/),
+  })
+  expect(placement(r, ROOM, OPUS, { ...DEFAULTS, inLoop: 'all' }).inLoop).toBe(true)
+  expect(readConfig({ inLoop: 'all' }).inLoop).toBe('all')
+  expect(readConfig({ inLoop: false }).inLoop).toBe(false)
+  expect(readConfig({}).inLoop).toBe(true)
+})
+
+test('a model the user names wins the note; plain words name nothing', () => {
+  const ids = (text: string) => namedIn(text, all).map(x => x.id)
+  expect(ids('Use architect on Opus for this, even if Claude quota is low')).toEqual(['opus'])
+  expect(ids('give it to GPT-6 Astra')).toEqual(['astra'])
+  expect(ids('run it on sol')).toEqual(['sol'])
+  expect(ids('add a muzzle flash and a worker thread to the opus magnum scene')).toEqual([])
+  const { r, place } = placed('shader', 'medium', ROOM, OPUS)
+  const note = contextNote(r, ROOM, NOW, place, namedIn('use sonnet', all))
+  expect(note).toMatch(/You named Sonnet 5\.5/)
+  expect(note).not.toMatch(/Do it in this loop|Suggested executor/)
+})
+
 test('a stronger or cheaper Claude pick than this chat is delegated', () => {
   expect(placed('shader', 'medium', ROOM, { model: 'claude-sonnet-5-5', context: 20 }).place).toMatchObject({
     inLoop: false,
@@ -129,6 +156,7 @@ test('a stronger or cheaper Claude pick than this chat is delegated', () => {
 
 test('reviews always go to a reviewer, and "review this shader" is a review', () => {
   expect(classify('review this shader for precision bugs')?.id).toBe('review')
+  expect(classify('review this shader for texture sampling bugs')?.id).toBe('review')
   expect(classify('review the render of the tower')?.id).toBe('art')
   const { r, place } = placed('review', 'medium', ROOM, OPUS)
   expect(r.pick?.pool).toBe('claude')

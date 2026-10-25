@@ -19,8 +19,11 @@ export type Config = {
   /** Ask a small model when no keyword matches. */
   classify: boolean
   classifyModel: string
-  /** Do work picked for a Claude model in the main loop when it can (see placement). */
-  inLoop: boolean
+  /**
+   * Do work picked for a Claude model in the main loop when it can (see placement). `true` leaves
+   * the user's own agent definitions to their agents; `'all'` folds those in too.
+   */
+  inLoop: boolean | 'all'
 }
 
 export const DEFAULTS: Config = {
@@ -47,7 +50,7 @@ export function readConfig(raw: unknown): Config {
     order,
     classify: o.classify !== false,
     classifyModel: typeof o.classifyModel === 'string' && o.classifyModel.trim() ? o.classifyModel.trim() : 'haiku',
-    inLoop: o.inLoop !== false,
+    inLoop: o.inLoop === false ? false : o.inLoop === 'all' ? 'all' : true,
   }
 }
 
@@ -78,7 +81,9 @@ export function classify(text: string): Category | undefined {
   const byId = (id: string) => CATEGORIES.find(c => c.id === id)
   const hits = (id: string) => byId(id)?.words.test(text) ?? false
   if (hits('lookup') && sizeOf(text) === 'small') return byId('lookup')
-  if (hits('review') && !hits('art')) return byId('review')
+  // "review this shader for texture bugs" is still a code review: art keeps only reviews of
+  // the look itself, with no code material named.
+  if (hits('review') && (!hits('art') || ['shader', 'blender', 'gamedev', 'frontend'].some(hits))) return byId('review')
   for (const id of [...DOMAINS, ...ACTIVITIES]) if (hits(id)) return byId(id)
   return undefined
 }
@@ -254,6 +259,9 @@ export function placement(r: Route, quota: Quota, loop: Loop, config: Config = D
   if (!pick) return { inLoop: false, reason: 'every pool near its limit' }
   if (pick.pool !== 'claude') return { inLoop: false, reason: 'it spends quota outside Claude' }
   if (!config.inLoop) return { inLoop: false, reason: 'inLoop is off in the config' }
+  if (pick.isCustom && config.inLoop !== 'all') {
+    return { inLoop: false, reason: `your own ${pick.agent} definition has its own instructions and tools` }
+  }
   if (r.isClaudeLow) return { inLoop: false, reason: 'Claude is near its limit' }
   if (typeof quota.claude?.['5h']?.used !== 'number' && typeof quota.claude?.['7d']?.used !== 'number') {
     return { inLoop: false, reason: "Claude's quota is unknown" }
@@ -271,8 +279,28 @@ export function placement(r: Route, quota: Quota, loop: Loop, config: Config = D
   return { inLoop: true, reason: `${pick.label} is this chat's own model, and a subagent would spend the same quota and hand back only a summary` }
 }
 
+/**
+ * Executors the user named in the prompt: a full label (`GPT-6 Astra`) anywhere, or an agent
+ * name (`architect`, `codex-builder`) or a model's own name (`opus`, `sol`) after a word like
+ * "use" or "on", so "a muzzle flash" or "a worker thread" names nothing.
+ */
+export function namedIn(text: string, executors: Executor[]): Executor[] {
+  const escape = (word: string) => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const has = (word: string, cue = '') => new RegExp(`(^|[^\\w-])${cue}${escape(word)}($|[^\\w-])`, 'i').test(text)
+  const CUE = '(?:use|using|with|on|via|ask|have|give it to|send it to|run it on)\\s+(?:the\\s+)?'
+  return executors.filter(x => {
+    const base = x.agent.replace(/^[^:]*:/, '')
+    if (has(x.label)) return true
+    if (base !== 'general-purpose' && has(base, CUE)) return true
+    return x.id !== 'opus-agy' && has(x.id, CUE)
+  })
+}
+
 /** The hidden note attached to a user prompt: one instruction, to do it here or to delegate. */
-export function contextNote(r: Route, quota: Quota, now: number, place?: Placement) {
+export function contextNote(r: Route, quota: Quota, now: number, place?: Placement, named: Executor[] = []) {
+  if (named.length) {
+    return `[router] You named ${named.map(x => x.label).join(' / ')}: use that, not a suggestion. Quota: ${quotaLine(quota, now)}.`
+  }
   if (!r.pick) {
     return `[router] Every pool is near its limit (${quotaLine(quota, now)}). Don't delegate: keep the work small and tell the user.`
   }

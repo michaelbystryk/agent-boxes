@@ -22,6 +22,15 @@ class EvalTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0]["ran"], rows[0]["outcome"]), ("in-loop", "pass"))
 
+    def test_adds_up_a_prompts_turns_and_one_delegated_turn_makes_it_delegated(self):
+        rows = router_eval.prompts(lines(
+            {"event": "route", "promptId": "a", "category": "shader", "policy": 2},
+            {"event": "turn", "promptId": "a", "ran": "in-loop", "ms": 1000},
+            {"event": "turn", "promptId": "a", "ran": "delegated", "ms": 5000},
+            {"event": "turn", "promptId": "a", "ran": "in-loop", "ms": 2000},
+        ))
+        self.assertEqual((rows[0]["ran"], rows[0]["ms"], rows[0]["turns"]), ("delegated", 8000, 3))
+
     def test_groups_by_category_and_how_it_ran(self):
         rows = router_eval.prompts(lines(
             {"event": "route", "promptId": "a", "category": "shader", "policy": 2},

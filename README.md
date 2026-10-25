@@ -83,13 +83,14 @@ When you have Claude, Codex and Antigravity (`agy`) all at once, the router deci
 3. **Decides where the work runs.** Following Anthropic's [advice on folding subagents into the main loop](https://claude.com/resources/articles/building-agents-when-to-fold-subagents-into-your-main-agent-loop): a Claude subagent spends the same quota as this chat and hands back only a summary, so work picked for a Claude model stays in this chat when it can. It is delegated instead when:
    - the pick is on Codex or agy (quota outside Claude, the reason to spread the load);
    - Claude is near its limit, or its quota is still unknown;
-   - it is a code review (the reviewer must not be the builder);
+   - it is a code review (the reviewer must not be the builder), including "review this shader for texture bugs";
+   - the pick is your own `worker` / `architect` / `scout` definition (from `~/.claude/agents` or the project), which has its own instructions and tool limits;
    - the pick is a cheaper model than this chat's (a Haiku lookup) or a stronger one (Opus while this chat runs Sonnet), or this chat's model is unknown;
    - this chat's context is 60% full (40% for a large task);
    - you set `"inLoop": false`.
 
-   Work done in this chat follows this chat's instructions, not those of your own `worker` or `architect` definitions. If you rely on their instructions or tool limits, set `"inLoop": false`.
-4. **Tells Claude**, in a hidden note on the prompt (press ctrl+o to see it), with one instruction: either `Do it in this loop: …` or `Suggested executor: Gemini 4 Argon, via subagent_type "agent-boxes:agy-argon". Why: best fit for hard bug fix. Fallback: Sonnet 5.5…`. A fixed routing policy in the system prompt explains the roster and the rules: follow the note, do quick steps yourself, a reviewer is never the builder, and a model you name yourself always wins. A relay's report ends with a `Result:` line naming its output and error files; after edits Claude checks the working tree (`git diff`), and it reads the output file only when the report is unclear or the work was a review, plan or research.
+   `"inLoop": "all"` folds in your own definitions too, for when they add nothing this chat lacks.
+4. **Tells Claude**, in a hidden note on the prompt (press ctrl+o to see it), with one instruction: either `Do it in this loop: …` or `Suggested executor: Gemini 4 Argon, via subagent_type "agent-boxes:agy-argon". Why: best fit for hard bug fix. Fallback: Sonnet 5.5…`. A fixed routing policy in the system prompt explains the roster and the rules: follow the note, do quick steps yourself, a reviewer is never the builder, and a model you name yourself always wins. Naming one ("use architect", "on Opus", "give it to GPT-6 Astra") replaces the note with `You named …: use that`, and steer mode then leaves that spawn alone even when its pool is short. A relay's report ends with a `Result:` line naming its output and error files; after edits Claude checks the working tree (`git diff`), and it reads the output file only when the report is unclear or the work was a review, plan or research.
 
 The `⇄ router` box at the bottom of the side bar shows the mode in its title. Before any routed prompt, it shows the pool best placed right now (`agy best placed · 97% free · 8 ready`). After one, it shows the pick (`this loop (Opus 5.5)` when the work stays here), the category, the reason and the fallback. It drops to one line when the side bar is short.
 
@@ -130,13 +131,13 @@ The note covers only the sandboxed launches, so a run without a sandbox is still
 | `order` | `{}` | Per category id, a ranking that replaces the catalog's, by executor id. |
 | `classify` | `true` | Ask a small model when no keyword matches. Turn off to label those prompts `general`. |
 | `classifyModel` | `"haiku"` | Model for that call. |
-| `inLoop` | `true` | Keep work picked for a Claude model in this chat when it can (see above). `false` delegates it, as before 0.6. |
+| `inLoop` | `true` | Keep work picked for a Claude model in this chat when it can (see above). `"all"` also folds in your own agent definitions; `false` delegates it all, as before 0.6. |
 
 `/route` prints the last pick with every candidate's score, where it ran and why, the live quota, and any agent the roster is missing.
 
 ### Checking that it helps
 
-The router logs every routed prompt to `~/.claude/agent-boxes/router-history.jsonl` (the last 1,000 lines): the route and where it ran, the main turn's time, any spawns, and an outcome. Your next reply grades the last result: "still broken" or "revert" counts as rework, "thanks" or "push it" as accepted, anything else as unknown. `/route pass` or `/route fail` grades it yourself and outranks the guess.
+The router logs every routed prompt to `~/.claude/agent-boxes/router-history.jsonl` (the last 1,000 lines): the route and where it ran, each main turn's time and spawns, and an outcome. A reply that isn't a new task ("go on", an answer to Claude's question) continues the same prompt: its turn is logged under it, and the eval adds the turns up. The next new task grades the last result, and so does a continuing reply that judges it: "still broken" or "revert" counts as rework, "thanks" or "push it" as accepted, anything else as unknown. `/route pass` or `/route fail` grades it yourself and outranks the guess.
 
 `python plugins/agent-boxes/scripts/router_eval.py` prints, per category, in-loop against delegated: how many, the median time, and good / bad / ungraded. `--policy 2` limits it to this policy's prompts; `--json` prints the table as JSON.
 

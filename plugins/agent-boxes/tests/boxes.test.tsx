@@ -417,6 +417,32 @@ test('steer mode moves a Claude spawn off Claude when it is out', async ($, on) 
   await ui.unmount()
 })
 
+test('steer mode leaves a spawn the user asked for by name', async ($, on) => {
+  const w = await start($, on, { ...SHORT, hasAgentFiles: true, config: { router: { mode: 'steer' } } })
+  const note = await submit($, `${SHADER}, use worker even if Claude quota is low`)
+  expect(note).toMatch(/You named Sonnet 5\.5/)
+  await spawn($)
+  expect(w.toasts.filter(t => /→/.test(t))).toEqual([])
+})
+
+test('a continuing reply adds its turn to the same prompt, and only a verdict grades it', async ($, on) => {
+  const w = await start($, on, { scan: QUOTA_SCAN })
+  await submit($, SHADER)
+  await $.turn.complete({ answer: 'Which edge?', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  await submit($, 'the left one')
+  await spawn($)
+  await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
+  await submit($, 'thanks, push it')
+  const events = history(w).filter(x => x.event !== 'spawn' && x.event !== 'done')
+  expect(events.map(x => [x.event, x.ran ?? x.outcome ?? x.inLoop])).toEqual([
+    ['route', true],
+    ['turn', 'in-loop'],
+    ['turn', 'delegated'],
+    ['outcome', 'accept'],
+  ])
+  expect(new Set(events.map(x => x.promptId)).size).toBe(1)
+})
+
 test('advise mode never rewrites a spawn, and logs it', async ($, on) => {
   const w = await start($, on, SHORT)
   await submit($, SHADER)

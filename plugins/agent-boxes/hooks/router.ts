@@ -22,6 +22,7 @@ import {
   classify,
   contextNote,
   leadLine,
+  namedIn,
   outcomeOf,
   placement,
   policy,
@@ -54,12 +55,20 @@ let scanned: Scan | null = null
 let config: Config = DEFAULTS
 // Each catalog agent's spawnable type, or undefined when there is none.
 let agents = new Map<string, string | undefined>()
+// Catalog agents that are the user's or the project's own definitions.
+let custom = new Set<string>()
+// Executor ids the user named in the latest prompt: steer mode leaves their spawns alone.
+let named = new Set<string>()
 let last: { route: Route; atMs: number; place: Placement } | undefined
 // Spawns this session started, by agent id, for the outcome log.
 let spawned = new Map<string, { atMs: number; category: string; promptId?: string }>()
 // The user's latest prompt, for the history: its id, when it came, and the spawns it led to.
 // `isOpen` until its main turn completes; `isGraded` once an outcome is logged for it.
-let prompt: { id: string; atMs: number; category: string; spawns: number; isOpen: boolean; isGraded: boolean } | undefined
+// A reply with no new task ("go on", an answer to a question) continues it: its turns and spawns
+// count toward the same prompt.
+let prompt:
+  | { id: string; category: string; turnAtMs: number; spawns: number; isOpen: boolean; isGraded: boolean }
+  | undefined
 let promptCount = 0
 let sessionMs = 0
 
@@ -80,12 +89,14 @@ async function loadConfig($: EngineInterface) {
 async function findAgents($: EngineInterface) {
   const dir = claudeDir
   agents = new Map()
+  custom = new Set()
   for (const x of roster({ ...config, enabled: [...config.enabled, 'fable'] })) {
     if (agents.has(x.agent)) continue
     let type: string | undefined
     if (BUILT_IN.includes(x.agent)) type = x.agent
     else if ((await $.fs.exists(`${dir}/agents/${x.agent}.md`)) || (await $.fs.exists(`.claude/agents/${x.agent}.md`))) {
       type = x.agent
+      custom.add(x.agent)
     } else if (SHIPPED.includes(x.agent)) type = `agent-boxes:${x.agent}`
     else if (x.pool === 'claude' && x.model) type = 'general-purpose'
     agents.set(x.agent, type)
@@ -93,7 +104,11 @@ async function findAgents($: EngineInterface) {
 }
 
 const executors = () =>
-  roster(config, a => agents.get(a) !== undefined).map(x => ({ ...x, agent: agents.get(x.agent) ?? x.agent }))
+  roster(config, a => agents.get(a) !== undefined).map(x => ({
+    ...x,
+    agent: agents.get(x.agent) ?? x.agent,
+    isCustom: custom.has(x.agent),
+  }))
 
 // Claude's windows from the session; Codex's and agy's from the side bar's scan.
 async function quota($: EngineInterface): Promise<Quota> {
@@ -206,7 +221,7 @@ async function report($: EngineInterface) {
 function steer(subagentType: string, model: string | undefined, quotaNow: Quota, now: number): Executor | undefined {
   const all = executors()
   const asked = all.find(x => x.agent === subagentType && (!x.model || !model || x.model === model))
-  if (!asked) return undefined
+  if (!asked || named.has(asked.id)) return undefined
   const category = last?.route.category ?? categoryById('general')
   const r = route(category, last?.route.size ?? 'medium', quotaNow, now, all, config)
   const isOut = r.scored.find(s => s.executor.id === asked.id)?.out ?? (asked.pool === 'claude' && r.isClaudeLow)
@@ -222,6 +237,7 @@ export async function startRouter($: EngineInterface, dir: string) {
   last = undefined
   spawned = new Map()
   prompt = undefined
+  named = new Set()
   promptCount = 0
   sessionMs = await $.clock.now()
   await loadConfig($)
@@ -248,9 +264,18 @@ export async function routeNote($: EngineInterface, e: PromptSubmitInput): Promi
   let note: string | undefined
   try {
     const now = await $.clock.now()
-    // This reply is the best signal of how the last prompt's work went.
-    if (prompt && !prompt.isGraded) await grade($, outcomeOf(e.text), 'reply')
     const category = await categorize($, e.text)
+    const mentioned = namedIn(e.text, executors())
+    named = new Set(mentioned.map(x => x.id))
+    // This reply is the best signal of how the last prompt's work went: a new task grades it
+    // either way, a continuation only when it says something about the result.
+    const verdict = outcomeOf(e.text)
+    if (prompt && !prompt.isGraded && (category || verdict !== 'unknown')) await grade($, verdict, 'reply')
+    if (!category && prompt) {
+      prompt.isOpen = true
+      prompt.turnAtMs = now
+      prompt.spawns = 0
+    }
     if (category) {
       const q = await quota($)
       const prev = last && now - last.atMs < FOLLOW_MS ? last.route.pick?.id : undefined
@@ -258,8 +283,8 @@ export async function routeNote($: EngineInterface, e: PromptSubmitInput): Promi
       const loop = await mainLoop($)
       const place = placement(r, q, loop, config)
       last = { route: r, atMs: now, place }
-      note = contextNote(r, q, now, place)
-      prompt = { id: `${sessionMs}-${++promptCount}`, atMs: now, category: category.id, spawns: 0, isOpen: true, isGraded: false }
+      note = contextNote(r, q, now, place, mentioned)
+      prompt = { id: `${sessionMs}-${++promptCount}`, category: category.id, turnAtMs: now, spawns: 0, isOpen: true, isGraded: false }
       await log($, {
         atMs: now,
         event: 'route',
@@ -271,6 +296,7 @@ export async function routeNote($: EngineInterface, e: PromptSubmitInput): Promi
         suggestedModel: r.pick?.model,
         inLoop: place.inLoop,
         placeReason: place.reason,
+        named: mentioned.map(x => x.id),
         mainModel: loop.model,
         context: loop.context,
         quota: quotaLine(q, now),
@@ -328,8 +354,8 @@ export async function agentDone($: EngineInterface, agentId: string | undefined)
   await log($, { atMs, event: 'done', promptId: run.promptId, agentId, category: run.category, ms: atMs - run.atMs })
 }
 
-// The main turn that answered the routed prompt ended: how it ran (in this loop or delegated)
-// and how long it took.
+// A main turn on the routed prompt ended (the first, or one after a continuing reply): how it ran
+// (in this loop or delegated) and how long it took. The eval adds a prompt's turns up.
 export async function turnDone($: EngineInterface) {
   if (!prompt?.isOpen) return
   prompt.isOpen = false
@@ -341,7 +367,7 @@ export async function turnDone($: EngineInterface) {
     category: prompt.category,
     ran: prompt.spawns ? 'delegated' : 'in-loop',
     spawns: prompt.spawns,
-    ms: atMs - prompt.atMs,
+    ms: atMs - prompt.turnAtMs,
   })
 }
 

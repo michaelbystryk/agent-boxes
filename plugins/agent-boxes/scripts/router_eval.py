@@ -34,7 +34,12 @@ def prompts(lines, policy=None):
             p.update(category=e.get("category"), policy=e.get("policy"), inLoop=e.get("inLoop"),
                      suggested=e.get("suggested"), mainModel=e.get("mainModel"))
         elif kind == "turn":
-            p.update(ran=e.get("ran"), ms=e.get("ms"), spawns=e.get("spawns"))
+            # A prompt's turns add up; one delegated turn makes it delegated.
+            ms = e.get("ms") if isinstance(e.get("ms"), (int, float)) else 0
+            p["ms"] = p.get("ms", 0) + ms
+            p["turns"] = p.get("turns", 0) + 1
+            if e.get("ran") == "delegated" or p.get("ran") != "delegated":
+                p["ran"] = e.get("ran")
         elif kind == "outcome":
             # A user's /route pass|fail outranks a guess from the next reply.
             if e.get("source") == "user" or p.get("source") != "user":
