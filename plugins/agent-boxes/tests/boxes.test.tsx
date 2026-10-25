@@ -324,6 +324,13 @@ async function submit($: Engine, text: string) {
   return got.context?.join('\n') ?? ''
 }
 
+const history = (w: World) =>
+  (w.writes.get('/home/u/.claude/agent-boxes/router-history.jsonl') ?? '')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+
 const spawn = ($: Engine) =>
   $.agent.spawn({
     tool_use_id: 't1',
@@ -415,16 +422,43 @@ test('advise mode never rewrites a spawn, and logs it', async ($, on) => {
   await submit($, SHADER)
   expect((await spawn($)).model).toBe('claude-sonnet-5-5')
   expect(w.toasts).toEqual([])
-  const log = w.writes.get('/home/u/.claude/agent-boxes/router-history.jsonl') ?? ''
-  expect(JSON.parse(log.trim()).agent).toBe('worker')
+  const [route, spawned] = history(w)
+  expect(route).toMatchObject({ event: 'route', inLoop: false, mainModel: 'claude-opus-5-5', policy: 2 })
+  expect(spawned).toMatchObject({ event: 'spawn', agent: 'worker', promptId: route.promptId })
 })
 
 test('parallel spawns each get a history line', async ($, on) => {
   const w = await start($, on, SHORT)
   await submit($, SHADER)
   await Promise.all([spawn($), spawn($), spawn($)])
-  const log = w.writes.get('/home/u/.claude/agent-boxes/router-history.jsonl') ?? ''
-  expect(log.trim().split('\n').length).toBe(3)
+  expect(history(w).filter(x => x.event === 'spawn').length).toBe(3)
+})
+
+test("a Claude pick on this chat's model is done in the loop, and the history grades it", async ($, on) => {
+  const w = await start($, on, { scan: QUOTA_SCAN })
+  const note = await submit($, SHADER)
+  expect(note).toMatch(/Do it in this loop/)
+  expect(note).not.toMatch(/Suggested executor/)
+  await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  await submit($, "that's still broken, the glow is gone")
+  await submit($, SHADER)
+  const got = await $.command.run({
+    command: 'route',
+    args: 'pass',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: false, columns: 160 },
+  })
+  expect('text' in got ? got.text : '').toMatch(/Logged pass/)
+  const events = history(w).map(x => [x.event, x.ran ?? x.outcome ?? x.inLoop])
+  expect(events).toEqual([
+    ['route', true],
+    ['turn', 'in-loop'],
+    ['outcome', 'rework'],
+    ['route', false], // a bug fix: Argon, outside Claude
+    ['outcome', 'unknown'],
+    ['route', true],
+    ['outcome', 'pass'],
+  ])
 })
 
 test('the router writes no route or quota files', async ($, on) => {

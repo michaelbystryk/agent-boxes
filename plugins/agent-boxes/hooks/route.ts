@@ -19,9 +19,19 @@ export type Config = {
   /** Ask a small model when no keyword matches. */
   classify: boolean
   classifyModel: string
+  /** Do work picked for a Claude model in the main loop when it can (see placement). */
+  inLoop: boolean
 }
 
-export const DEFAULTS: Config = { mode: 'advise', disabled: [], enabled: [], order: {}, classify: true, classifyModel: 'haiku' }
+export const DEFAULTS: Config = {
+  mode: 'advise',
+  disabled: [],
+  enabled: [],
+  order: {},
+  classify: true,
+  classifyModel: 'haiku',
+  inLoop: true,
+}
 
 export function readConfig(raw: unknown): Config {
   const o = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
@@ -37,6 +47,7 @@ export function readConfig(raw: unknown): Config {
     order,
     classify: o.classify !== false,
     classifyModel: typeof o.classifyModel === 'string' && o.classifyModel.trim() ? o.classifyModel.trim() : 'haiku',
+    inLoop: o.inLoop !== false,
   }
 }
 
@@ -50,7 +61,8 @@ export function roster(config: Config, hasAgent: (agent: string) => boolean = ()
 }
 
 // Domains name the material (Blender, shaders); activities name the work (review, fix).
-// A domain wins over an activity, except a short lookup question.
+// A domain wins over an activity, except a short lookup question and a code review: "review
+// this shader" wants an independent reviewer, not a shader writer. Art has its own review.
 const DOMAINS = ['blender', 'shader', 'gamedev', 'art', 'frontend']
 const ACTIVITIES = ['review', 'bugfix', 'refactor', 'terminal', 'design', 'research', 'build', 'lookup']
 
@@ -66,6 +78,7 @@ export function classify(text: string): Category | undefined {
   const byId = (id: string) => CATEGORIES.find(c => c.id === id)
   const hits = (id: string) => byId(id)?.words.test(text) ?? false
   if (hits('lookup') && sizeOf(text) === 'small') return byId('lookup')
+  if (hits('review') && !hits('art')) return byId('review')
   for (const id of [...DOMAINS, ...ACTIVITIES]) if (hits(id)) return byId(id)
   return undefined
 }
@@ -79,6 +92,10 @@ const OUT: Record<'5h' | '7d', number> = { '5h': 90, '7d': 95 }
 const CLAUDE_OUT: Record<'5h' | '7d', number> = { '5h': 85, '7d': 92 }
 // Fit by rank: the first choice, then each next a little less.
 const FIT = [1, 0.85, 0.72, 0.62, 0.55]
+// A follow-up prompt leans toward the executor that took the one before, so one piece of work
+// doesn't hop between vendors turn by turn. Reviews and lookups are deliberate splits: no lean.
+const STICKY = 1.15
+const UNSTICKY = ['review', 'lookup']
 
 export type PoolState = { isOut: boolean; headroom: number; bonus: number; reason?: string }
 
@@ -130,6 +147,8 @@ export function route(
   now: number,
   executors: Executor[],
   config: Config = DEFAULTS,
+  /** The executor id that took the previous prompt, for a follow-up. */
+  prev?: string,
 ): Route {
   const byId = new Map(executors.map(x => [x.id, x]))
   const states = new Map<Pool, PoolState>()
@@ -153,7 +172,8 @@ export function route(
     const s = stateOf(executor.pool)
     if (s.isOut) return { executor, score: 0, rank, out: s.reason }
     const fit = FIT[Math.min(rank, FIT.length - 1)]!
-    const score = fit * (1 - weight + weight * s.headroom) * (1 + s.bonus) / (1 + thrift * (executor.cost - 1))
+    const stick = executor.id === prev && !UNSTICKY.includes(category.id) ? STICKY : 1
+    const score = (stick * fit * (1 - weight + weight * s.headroom) * (1 + s.bonus)) / (1 + thrift * (executor.cost - 1))
     return { executor, score, rank }
   })
   const live = scored.filter(s => !s.out).sort((a, b) => b.score - a.score)
@@ -210,23 +230,78 @@ export function quotaLine(quota: Quota, now: number) {
 
 const how = (x: Executor) => `subagent_type "${x.agent}"${x.model ? `, model "${x.model}"` : ''}`
 
-/** The hidden note attached to a user prompt. */
-export function contextNote(r: Route, quota: Quota, now: number) {
-  if (!r.pick) {
-    return `[router] Every pool is near its limit (${quotaLine(quota, now)}). Keep work small and tell the user.`
+/** The main loop: its model id and how full its context is (percent). */
+export type Loop = { model?: string; context?: number }
+export type Placement = { inLoop: boolean; reason: string }
+
+// Claude models by strength; a model id or alias matches by family name.
+const TIERS: [RegExp, number][] = [[/haiku/i, 1], [/sonnet/i, 2], [/opus/i, 3], [/fable/i, 4]]
+const tierOf = (model?: string) => TIERS.find(([re]) => re.test(model ?? ''))?.[1]
+// Past this share of context, new work goes to a fresh one; large work goes sooner.
+const CONTEXT_FULL = 60
+const CONTEXT_FULL_LARGE = 40
+
+/**
+ * Where the pick's work should run. Outside quota (Codex, agy) is always delegated: that is
+ * what spreading the load is for. A Claude pick stays in this loop, which keeps its context and
+ * spends the same quota a subagent would, unless: the user turned that off; Claude's quota is
+ * unknown or short; it is a review (an independent reviewer); the pick is a cheaper model than
+ * this loop's (a Haiku lookup); the pick is stronger than this loop's model; or the context is
+ * filling up.
+ */
+export function placement(r: Route, quota: Quota, loop: Loop, config: Config = DEFAULTS): Placement {
+  const pick = r.pick
+  if (!pick) return { inLoop: false, reason: 'every pool near its limit' }
+  if (pick.pool !== 'claude') return { inLoop: false, reason: 'it spends quota outside Claude' }
+  if (!config.inLoop) return { inLoop: false, reason: 'inLoop is off in the config' }
+  if (r.isClaudeLow) return { inLoop: false, reason: 'Claude is near its limit' }
+  if (typeof quota.claude?.['5h']?.used !== 'number' && typeof quota.claude?.['7d']?.used !== 'number') {
+    return { inLoop: false, reason: "Claude's quota is unknown" }
   }
-  const lines = [
-    `[router] This request looks like ${r.category.title} (${r.size}).`,
-    `Suggested executor: ${r.pick.label}, via ${how(r.pick)}. Why: ${r.why}.`,
-  ]
-  if (r.fallback) lines.push(`Fallback: ${r.fallback.label}, via ${how(r.fallback)}.`)
+  if (r.category.id === 'review') return { inLoop: false, reason: 'a review needs a reviewer that did not build the work' }
+  const mine = tierOf(loop.model)
+  const theirs = tierOf(pick.model ?? pick.label)
+  if (!mine || !theirs) return { inLoop: false, reason: "this chat's model is unknown" }
+  if (theirs < mine) return { inLoop: false, reason: `${pick.label} is cheaper than this chat's model` }
+  if (theirs > mine) return { inLoop: false, reason: `${pick.label} is stronger than this chat's model` }
+  const full = r.size === 'large' ? CONTEXT_FULL_LARGE : CONTEXT_FULL
+  if (typeof loop.context === 'number' && loop.context >= full) {
+    return { inLoop: false, reason: `this chat's context is ${Math.round(loop.context)}% full` }
+  }
+  return { inLoop: true, reason: `${pick.label} is this chat's own model, and a subagent would spend the same quota and hand back only a summary` }
+}
+
+/** The hidden note attached to a user prompt: one instruction, to do it here or to delegate. */
+export function contextNote(r: Route, quota: Quota, now: number, place?: Placement) {
+  if (!r.pick) {
+    return `[router] Every pool is near its limit (${quotaLine(quota, now)}). Don't delegate: keep the work small and tell the user.`
+  }
+  const lines = [`[router] This request looks like ${r.category.title} (${r.size}).`]
+  if (place?.inLoop) {
+    lines.push(`Do it in this loop: ${place.reason}.`)
+    lines.push(`Only parallel work on disjoint paths or a broad read-only sweep goes out, to ${r.pick.label} via ${how(r.pick)}.`)
+  } else {
+    lines.push(`Suggested executor: ${r.pick.label}, via ${how(r.pick)}. Why: ${r.why}.`)
+    if (place && r.pick.pool === 'claude') lines.push(`Delegate it: ${place.reason}.`)
+    if (r.fallback) lines.push(`Fallback: ${r.fallback.label}, via ${how(r.fallback)}.`)
+  }
   lines.push(`Quota: ${quotaLine(quota, now)}.`)
   if (r.isClaudeLow) {
     lines.push('Claude is near its limit: delegate substantive work to the suggestion and keep your own turns short.')
-  } else if (r.pick.pool === 'claude') {
-    lines.push("The pick is on Claude's own quota: do it in this loop unless it is parallel work, a review or a broad read-only sweep.")
   }
   return lines.join('\n')
+}
+
+// A reply that says the last result was wrong, or that it was fine. Neither is proof; the
+// history keeps the signal next to the route so a few dozen prompts can be compared.
+const REWORK = /\b(wrong|still (broken|failing|fails|there|not)|broke|revert|undo|try again|redo|doesn'?t work|didn'?t work|not working|that'?s not)\b/i
+const ACCEPT = /\b(thanks|thank you|great|perfect|looks good|lgtm|works now|nice|ship it|push( it)?|merge( it)?)\b/i
+
+/** The next prompt's verdict on the last result: rework, accept, or unknown. */
+export function outcomeOf(text: string): 'rework' | 'accept' | 'unknown' {
+  if (REWORK.test(text)) return 'rework'
+  if (ACCEPT.test(text)) return 'accept'
+  return 'unknown'
 }
 
 /** The routing policy for the main agent's system prompt; it changes only with the roster. */
@@ -236,11 +311,11 @@ export function policy(executors: Executor[]) {
     '# Model routing (agent-boxes router)',
     'Work is spread over three subscriptions: Claude, OpenAI Codex and Google Antigravity (agy). Each user prompt may carry a [router] note naming the executor best suited to it, picked from benchmark fit and live quota.',
     'Rules:',
-    '- Do quick, trivial steps yourself.',
-    '- When the suggestion runs on Codex or agy, delegate substantive work to it through the Agent tool: that spends quota outside Claude.',
-    '- When the suggestion runs on Claude and Claude has room, do the work in this loop: another Claude subagent spends the same quota and hands back only a summary. Still delegate parallel work on disjoint paths, reviews and broad read-only sweeps.',
-    '- When Claude is near its limit, delegate all substantive work to the suggestion.',
-    "- A Codex or agy relay's report ends with the path of its full output file. Read that file before building on the result: the report is a summary.",
+    '- Each note gives one instruction: "Do it in this loop" or "Suggested executor". Follow it; do quick, trivial steps yourself either way.',
+    '- Work for Codex or agy is delegated through the Agent tool: it spends quota outside Claude.',
+    '- Work for a Claude model stays in this loop when the note says so: a subagent would spend the same quota and hand back only a summary. Parallel work on disjoint paths and broad read-only sweeps can still go out.',
+    '- When Claude is near its limit, delegate all substantive work to the suggestion. When every pool is near its limit, keep the work small and tell the user.',
+    "- A relay's report ends with a `Result:` line naming its output and error files. After edits, check the working tree (git diff), not the report. Read the output file, only the parts you need, when the report is unclear or the work was a review, plan or research. A relay without that line: rely on its report and the working tree.",
     '- If the user named a model or agent, use theirs and ignore the suggestion.',
     '- A reviewer must not be the agent that built the work; prefer one on another subscription.',
     '- If an executor fails or is rate-limited twice, move to the fallback.',

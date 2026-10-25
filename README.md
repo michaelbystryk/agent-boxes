@@ -79,14 +79,19 @@ When you have Claude, Codex and Antigravity (`agy`) all at once, the router deci
    - **Use it or lose it:** a 7-day window that resets soon with a lot unused earns a bonus. One used ahead of the clock gets a penalty.
    - Big tasks weigh quota more. Small tasks lean toward cheap executors.
    - When Claude is short, Opus and Sonnet places go to **Opus via agy**, the same model on Google's quota.
-3. **Tells Claude**, in a hidden note on the prompt (press ctrl+o to see it), for example: `Suggested executor: Gemini 4 Argon, via subagent_type "agent-boxes:agy-argon". Why: best fit for hard bug fix. Fallback: Sonnet 5.5…`. A fixed routing policy in the system prompt explains the roster and the rules:
-   - Work picked for Codex or agy is delegated, since that spends quota outside Claude.
-   - Work picked for a Claude model stays in the main loop while Claude has room. Another Claude subagent would spend the same quota and hand back only a summary (the note says `do it in this loop`). Parallel work, reviews and broad read-only sweeps still go to subagents.
-   - Near Claude's limit, all substantive work is delegated.
-   - A relay's report ends with the path of its full output, which Claude reads before building on the result.
-   - A reviewer is never the builder, and a model you name yourself always wins.
+   - A follow-up within 15 minutes leans toward the executor that took the prompt before, so one piece of work doesn't hop between vendors turn by turn. Reviews and lookups don't lean.
+3. **Decides where the work runs.** Following Anthropic's [advice on folding subagents into the main loop](https://claude.com/resources/articles/building-agents-when-to-fold-subagents-into-your-main-agent-loop): a Claude subagent spends the same quota as this chat and hands back only a summary, so work picked for a Claude model stays in this chat when it can. It is delegated instead when:
+   - the pick is on Codex or agy (quota outside Claude, the reason to spread the load);
+   - Claude is near its limit, or its quota is still unknown;
+   - it is a code review (the reviewer must not be the builder);
+   - the pick is a cheaper model than this chat's (a Haiku lookup) or a stronger one (Opus while this chat runs Sonnet), or this chat's model is unknown;
+   - this chat's context is 60% full (40% for a large task);
+   - you set `"inLoop": false`.
 
-The `⇄ router` box at the bottom of the side bar shows the mode in its title. Before any routed prompt, it shows the pool best placed right now (`agy best placed · 97% free · 8 ready`). After one, it shows the pick, the category, the reason and the fallback. It drops to one line when the side bar is short.
+   Work done in this chat follows this chat's instructions, not those of your own `worker` or `architect` definitions. If you rely on their instructions or tool limits, set `"inLoop": false`.
+4. **Tells Claude**, in a hidden note on the prompt (press ctrl+o to see it), with one instruction: either `Do it in this loop: …` or `Suggested executor: Gemini 4 Argon, via subagent_type "agent-boxes:agy-argon". Why: best fit for hard bug fix. Fallback: Sonnet 5.5…`. A fixed routing policy in the system prompt explains the roster and the rules: follow the note, do quick steps yourself, a reviewer is never the builder, and a model you name yourself always wins. A relay's report ends with a `Result:` line naming its output and error files; after edits Claude checks the working tree (`git diff`), and it reads the output file only when the report is unclear or the work was a review, plan or research.
+
+The `⇄ router` box at the bottom of the side bar shows the mode in its title. Before any routed prompt, it shows the pool best placed right now (`agy best placed · 97% free · 8 ready`). After one, it shows the pick (`this loop (Opus 5.5)` when the work stays here), the category, the reason and the fallback. It drops to one line when the side bar is short.
 
 Codex and agy quota come from the side bar's own scan, so their pools count as unknown (not empty) until Python has run it once. Sol and Astra need `codex` signed in; Argon, Flash and Opus via agy need `agy` signed in, and Argon needs an agy plan that includes it (AI Pro or Ultra).
 
@@ -125,8 +130,17 @@ The note covers only the sandboxed launches, so a run without a sandbox is still
 | `order` | `{}` | Per category id, a ranking that replaces the catalog's, by executor id. |
 | `classify` | `true` | Ask a small model when no keyword matches. Turn off to label those prompts `general`. |
 | `classifyModel` | `"haiku"` | Model for that call. |
+| `inLoop` | `true` | Keep work picked for a Claude model in this chat when it can (see above). `false` delegates it, as before 0.6. |
 
-`/route` prints the last pick with every candidate's score, the live quota, and any agent the roster is missing.
+`/route` prints the last pick with every candidate's score, where it ran and why, the live quota, and any agent the roster is missing.
+
+### Checking that it helps
+
+The router logs every routed prompt to `~/.claude/agent-boxes/router-history.jsonl` (the last 1,000 lines): the route and where it ran, the main turn's time, any spawns, and an outcome. Your next reply grades the last result: "still broken" or "revert" counts as rework, "thanks" or "push it" as accepted, anything else as unknown. `/route pass` or `/route fail` grades it yourself and outranks the guess.
+
+`python plugins/agent-boxes/scripts/router_eval.py` prints, per category, in-loop against delegated: how many, the median time, and good / bad / ungraded. `--policy 2` limits it to this policy's prompts; `--json` prints the table as JSON.
+
+For a fair comparison, take about ten tasks you know the answer to, run each twice with `"inLoop": true` and twice with `"inLoop": false` from the same starting commit, grade each with `/route pass|fail`, and compare the two rows per category. Look at which tasks flipped, not only the totals.
 
 Claude Code's own model settings are Claude-only and blind to the task and to quota: `opusplan` switches models on plan mode, `fallbackModel` steps in on overload rather than on rate limits, and subagents take their model from their definition or `CLAUDE_CODE_SUBAGENT_MODEL`. The router leaves all of them alone and only suggests (or in `steer` mode sets) each spawn's agent type and model. If `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` is set, Claude model picks are overridden, and `/route` says so.
 
@@ -164,7 +178,7 @@ claude --plugin-dir plugins/agent-boxes      # run a chat with your working copy
 claude plugin validate .                     # the marketplace
 claude plugin validate plugins/agent-boxes
 claude plugin test plugins/agent-boxes
-(cd plugins/agent-boxes && python3 -E -m unittest tests/test_scan.py)   # the scanners' tests
+(cd plugins/agent-boxes && python3 -E -m unittest tests/test_scan.py tests/test_eval.py)   # the scripts' tests
 python3 -E plugins/agent-boxes/scripts/boxes.py <session-id>   # the scan's raw JSON
 ```
 
@@ -174,7 +188,7 @@ In `plugins/agent-boxes/`:
 - `hooks/route.ts` holds the classifier and balancer (pure functions).
 - `hooks/catalog.ts` holds the executors and rankings.
 - `agents/` holds the Codex and agy relays.
-- `scripts/` holds the Codex and Antigravity scanners.
+- `scripts/` holds the Codex and Antigravity scanners, and `router_eval.py`, which summarises the router's history.
 
 `docs/make_shots.py` draws the README screenshots from made-up scenes, with the side bar's own colours and layout: `python docs/make_shots.py docs` (needs Pillow and the Windows Consolas font).
 

@@ -22,6 +22,8 @@ import {
   classify,
   contextNote,
   leadLine,
+  outcomeOf,
+  placement,
   policy,
   quotaLine,
   readConfig,
@@ -29,7 +31,7 @@ import {
   route,
   sizeOf,
 } from './route'
-import type { Config, Quota, Route, Windows } from './route'
+import type { Config, Loop, Placement, Quota, Route, Windows } from './route'
 
 // Agent types that ship with Claude Code, and the relays this plugin ships in agents/.
 const BUILT_IN = ['general-purpose', 'Explore', 'Plan']
@@ -37,6 +39,10 @@ const SHIPPED = ['codex-builder', 'codex-astra', 'agy-argon', 'agy-flash', 'agy-
 // A prompt this short with no keyword is a reply in the running task ("yes", "go on"): no note.
 const REPLY_WORDS = 4
 const HISTORY_LINES = 1000
+// A prompt within this long of the last routed one is a follow-up: it leans toward the same executor.
+const FOLLOW_MS = 15 * 60e3
+// Bumped when the policy's rules change, so the history can compare before and after.
+const POLICY_VERSION = 2
 
 // The router box's state, drawn by register.tsx; null while the router is off.
 const routeBox = atom({ plugin: 'agent-boxes', key: 'route' } as const, null)
@@ -48,9 +54,14 @@ let scanned: Scan | null = null
 let config: Config = DEFAULTS
 // Each catalog agent's spawnable type, or undefined when there is none.
 let agents = new Map<string, string | undefined>()
-let last: { route: Route; atMs: number } | undefined
+let last: { route: Route; atMs: number; place: Placement } | undefined
 // Spawns this session started, by agent id, for the outcome log.
-let spawned = new Map<string, { atMs: number; category: string }>()
+let spawned = new Map<string, { atMs: number; category: string; promptId?: string }>()
+// The user's latest prompt, for the history: its id, when it came, and the spawns it led to.
+// `isOpen` until its main turn completes; `isGraded` once an outcome is logged for it.
+let prompt: { id: string; atMs: number; category: string; spawns: number; isOpen: boolean; isGraded: boolean } | undefined
+let promptCount = 0
+let sessionMs = 0
 
 // The `router` key of agent-boxes/config.json: an object of options, or a mode alone ("off").
 async function loadConfig($: EngineInterface) {
@@ -135,7 +146,7 @@ export async function refresh($: EngineInterface, scan?: Scan) {
     lead: leadLine(await quota($), await $.clock.now(), executors()),
     category: r?.category.id ?? '',
     size: r?.size ?? '',
-    pick: r?.pick?.label ?? '',
+    pick: r?.pick ? (last?.place.inLoop ? `this loop (${r.pick.label})` : r.pick.label) : '',
     fallback: r?.fallback?.label ?? '',
     why: r?.why ?? '',
     atMs: last?.atMs ?? 0,
@@ -181,6 +192,7 @@ async function report($: EngineInterface) {
   } else {
     const r = last.route
     lines.push(`Last prompt: ${r.category.title} (${r.size}) → ${r.pick?.label ?? 'none'} (${r.why})`)
+    lines.push(`  ${last.place.inLoop ? 'In this loop' : 'Delegated'}: ${last.place.reason}`)
     for (const s of r.scored) {
       lines.push(`  ${s.rank + 1}. ${s.executor.label.padEnd(18)} ${s.out ? `out: ${s.out}` : s.score.toFixed(2)}`)
     }
@@ -209,9 +221,15 @@ export async function startRouter($: EngineInterface, dir: string) {
   scanned = null
   last = undefined
   spawned = new Map()
+  prompt = undefined
+  promptCount = 0
+  sessionMs = await $.clock.now()
   await loadConfig($)
   await findAgents($)
-  await $.command.register({ name: 'route', description: 'Show which model the router picks and why' })
+  await $.command.register({
+    name: 'route',
+    description: 'Show which model the router picks and why; /route pass or /route fail grades the last result',
+  })
   await refresh($)
 }
 
@@ -229,13 +247,34 @@ export async function routeNote($: EngineInterface, e: PromptSubmitInput): Promi
   if (config.mode === 'off' || e.isMeta || e.command || !isUsers || !e.text.trim()) return undefined
   let note: string | undefined
   try {
+    const now = await $.clock.now()
+    // This reply is the best signal of how the last prompt's work went.
+    if (prompt && !prompt.isGraded) await grade($, outcomeOf(e.text), 'reply')
     const category = await categorize($, e.text)
     if (category) {
-      const now = await $.clock.now()
       const q = await quota($)
-      const r = route(category, sizeOf(e.text), q, now, executors(), config)
-      last = { route: r, atMs: now }
-      note = contextNote(r, q, now)
+      const prev = last && now - last.atMs < FOLLOW_MS ? last.route.pick?.id : undefined
+      const r = route(category, sizeOf(e.text), q, now, executors(), config, prev)
+      const loop = await mainLoop($)
+      const place = placement(r, q, loop, config)
+      last = { route: r, atMs: now, place }
+      note = contextNote(r, q, now, place)
+      prompt = { id: `${sessionMs}-${++promptCount}`, atMs: now, category: category.id, spawns: 0, isOpen: true, isGraded: false }
+      await log($, {
+        atMs: now,
+        event: 'route',
+        promptId: prompt.id,
+        policy: POLICY_VERSION,
+        category: category.id,
+        size: r.size,
+        suggested: r.pick?.agent,
+        suggestedModel: r.pick?.model,
+        inLoop: place.inLoop,
+        placeReason: place.reason,
+        mainModel: loop.model,
+        context: loop.context,
+        quota: quotaLine(q, now),
+      })
     }
     await refresh($)
   } catch (err) {
@@ -265,10 +304,13 @@ export async function spawnedAgent($: EngineInterface, asked: AgentSpawnInput, r
   if (config.mode === 'off' || !isPlain(asked) || !done.agentId) return
   const atMs = await $.clock.now()
   const category = last?.route.category.id ?? ''
-  spawned.set(done.agentId, { atMs, category })
+  const promptId = prompt?.isOpen ? prompt.id : undefined
+  if (prompt?.isOpen) prompt.spawns++
+  spawned.set(done.agentId, { atMs, category, promptId })
   await log($, {
     atMs,
     event: 'spawn',
+    promptId,
     agentId: done.agentId,
     category,
     suggested: last?.route.pick?.agent,
@@ -283,18 +325,66 @@ export async function agentDone($: EngineInterface, agentId: string | undefined)
   if (!run || !agentId) return
   spawned.delete(agentId)
   const atMs = await $.clock.now()
-  await log($, { atMs, event: 'done', agentId, category: run.category, ms: atMs - run.atMs })
+  await log($, { atMs, event: 'done', promptId: run.promptId, agentId, category: run.category, ms: atMs - run.atMs })
+}
+
+// The main turn that answered the routed prompt ended: how it ran (in this loop or delegated)
+// and how long it took.
+export async function turnDone($: EngineInterface) {
+  if (!prompt?.isOpen) return
+  prompt.isOpen = false
+  const atMs = await $.clock.now()
+  await log($, {
+    atMs,
+    event: 'turn',
+    promptId: prompt.id,
+    category: prompt.category,
+    ran: prompt.spawns ? 'delegated' : 'in-loop',
+    spawns: prompt.spawns,
+    ms: atMs - prompt.atMs,
+  })
+}
+
+// An outcome for the last routed prompt, from the next reply's words or from /route pass|fail.
+async function grade($: EngineInterface, outcome: string, source: 'reply' | 'user') {
+  if (!prompt) return
+  prompt.isGraded = true
+  await log($, { atMs: await $.clock.now(), event: 'outcome', promptId: prompt.id, category: prompt.category, outcome, source })
+}
+
+// This chat's model and context, for placement. Unknown parts stay unset.
+async function mainLoop($: EngineInterface): Promise<Loop> {
+  const loop: Loop = {}
+  try {
+    loop.model = await $.session.model()
+  } catch {
+    // unknown model: placement delegates
+  }
+  try {
+    loop.context = (await $.session.usage()).context.percent
+  } catch {
+    // unknown context
+  }
+  return loop
 }
 
 // A /clear starts a new conversation: the last pick no longer applies.
 export async function forgetRoute($: EngineInterface) {
   last = undefined
   spawned = new Map()
+  prompt = undefined
   await refresh($)
 }
 
-// What /route prints, after re-reading the config and the agent definitions.
-export async function routeCommand($: EngineInterface) {
+// What /route prints, after re-reading the config and the agent definitions. `/route pass` or
+// `/route fail` grades the last routed prompt's result instead.
+export async function routeCommand($: EngineInterface, args = '') {
+  const verdict = args.trim().toLowerCase()
+  if (verdict === 'pass' || verdict === 'fail') {
+    if (!prompt) return 'No routed prompt to grade yet in this session.'
+    await grade($, verdict, 'user')
+    return `Logged ${verdict} for the last routed prompt (${prompt.category}).`
+  }
   await loadConfig($)
   await findAgents($)
   await refresh($)
