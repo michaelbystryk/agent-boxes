@@ -90,16 +90,39 @@ def agy_action(ev):
 
 
 def tool_calls(path):
-    """Claude's tool calls over the whole log; image results make it outgrow any tail."""
-    n = 0
+    """Checkpoint Claude's tool count; only read bytes appended since the last poll."""
+    stat = os.stat(path)
+    cache = codex_scan.state_path("bench", os.path.abspath(path))
+    data = codex_scan.read_state(cache)
+    if (data.get("ino") != stat.st_ino or stat.st_size < data.get("size", 0)
+            or stat.st_size == data.get("size") and stat.st_mtime_ns != data.get("mtime")):
+        data = {}
+    n, offset = data.get("count", 0), data.get("offset", 0)
+    budget = TAIL
+    deadline = time.monotonic() + 0.5
     with open(path, "rb") as f:
-        for line in f:
-            if line.startswith(b'{"type":"assistant"') and b'"tool_use"' in line:
-                try:
-                    content = codex_scan.obj(json.loads(line).get("message")).get("content") or []
-                except ValueError:
-                    continue
+        f.seek(offset)
+        while budget > 0 and time.monotonic() < deadline:
+            # Finish one record even if it exceeds the poll allowance (images can
+            # make a single JSON line huge), then checkpoint before the next one.
+            line = f.readline()
+            if not line:
+                break
+            budget -= len(line)
+            try:
+                ev = codex_scan.obj(json.loads(line))
+            except ValueError:
+                if not line.endswith(b"\n"):
+                    break  # unfinished record: retry next poll
+                offset = f.tell()
+                continue
+            if ev.get("type") == "assistant":
+                content = codex_scan.obj(ev.get("message")).get("content") or []
                 n += sum(1 for b in content if codex_scan.obj(b).get("type") == "tool_use")
+            offset = f.tell()
+    if offset != data.get("offset") or stat.st_size != data.get("size"):
+        codex_scan.save_transcript(cache, {"ino": stat.st_ino, "size": stat.st_size, "mtime": stat.st_mtime_ns,
+                                           "offset": offset, "count": n})
     return n
 
 

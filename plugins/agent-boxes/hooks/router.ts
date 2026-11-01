@@ -13,16 +13,20 @@ import type {
   SessionRateLimit,
 } from 'claude-code'
 
-import type { Scan } from '../types'
+import type { Scan, ToolBox } from '../types'
 import { CATEGORIES } from './catalog'
-import type { Category, Executor } from './catalog'
+import type { Category, Executor, Pool } from './catalog'
 import {
   DEFAULTS,
   categoryById,
   classify,
   contextNote,
+  firstJson,
+  isContinuation,
+  poolState,
   leadLine,
   namedIn,
+  namedNote,
   outcomeOf,
   placement,
   policy,
@@ -43,15 +47,50 @@ const HISTORY_LINES = 1000
 // A prompt within this long of the last routed one is a follow-up: it leans toward the same executor.
 const FOLLOW_MS = 15 * 60e3
 // Bumped when the policy's rules change, so the history can compare before and after.
-const POLICY_VERSION = 2
+const POLICY_VERSION = 3
+// The small model sorts only prompts this long with no keyword: shorter ones are general, and
+// a small or general task's placement wouldn't change with a finer label.
+const CLASSIFY_WORDS = 15
+const CLASSIFY_TIMEOUT_MS = 1500
+// A provider's last good reading: used while scans keep coming; once its box goes stale (the
+// scan failed or was slow), only this long, then the pool counts as unknown.
+const STALE_MS = 10 * 60e3
+const FRESH_MS = 60 * 60e3
+// Claude's last reading, when the session has none (API key, a gap in rateLimits).
+const CLAUDE_KEEP_MS = 5 * 3600e3
+// A relay that reports `Result: rate-limited` puts its pool out this long, or until a scan at
+// least CLEAR_AFTER_MS later shows a new reading with headroom (an unchanged or earlier one may
+// not see the limit it hit).
+const COOLDOWN_MS = 30 * 60e3
+const CLEAR_AFTER_MS = 5 * 60e3
+const RATE_LIMITED = /(^|\n)Result: rate-limited\s*$/
+// The same background error category is logged at most this often.
+const LOG_EVERY_MS = 30 * 60e3
+// A spawn that ended with no turn.complete (aborted) is forgotten after this long.
+const SPAWN_KEEP_MS = 3600e3
 
 // The router box's state, drawn by register.tsx; null while the router is off.
 const routeBox = atom({ plugin: 'agent-boxes', key: 'route' } as const, null)
 
 // <claude dir>, from register.tsx at session start.
 let claudeDir = ''
-// The side bar's latest good scan, for Codex's and agy's windows.
-let scanned: Scan | null = null
+// Each pool's last good reading from the side bar's scan (Codex, agy) or the session (Claude).
+// `limited`: pools a relay found rate-limited, when, and the reading then held (a scan that
+// repeats it has not seen the limit, so it doesn't clear it).
+type Reading = { w: Windows; atMs: number; isStale: boolean }
+type Limit = { atMs: number; seen: string }
+export type Book = { readings: Map<Pool, Reading>; limited: Map<Pool, Limit> }
+export const newBook = (): Book => ({ readings: new Map(), limited: new Map() })
+
+/** A relay of this pool reported a rate limit just now. */
+export function markLimited(book: Book, pool: Pool, now: number) {
+  book.limited.set(pool, { atMs: now, seen: JSON.stringify(book.readings.get(pool)?.w ?? null) })
+}
+let book = newBook()
+// What the last scan-driven refresh drew from, so an unchanged scan costs nothing.
+let scanSig = ''
+// Background error categories already logged, and when.
+let logged = new Map<string, number>()
 let config: Config = DEFAULTS
 // Each catalog agent's spawnable type, or undefined when there is none.
 let agents = new Map<string, string | undefined>()
@@ -61,7 +100,7 @@ let custom = new Set<string>()
 let named = new Set<string>()
 let last: { route: Route; atMs: number; place: Placement } | undefined
 // Spawns this session started, by agent id, for the outcome log.
-let spawned = new Map<string, { atMs: number; category: string; promptId?: string }>()
+let spawned = new Map<string, { atMs: number; category: string; promptId?: string; pool?: Pool }>()
 // The user's latest prompt, for the history: its id, when it came, and the spawns it led to.
 // `isOpen` until its main turn completes; `isGraded` once an outcome is logged for it.
 // A reply with no new task ("go on", an answer to a question) continues it: its turns and spawns
@@ -94,7 +133,12 @@ async function findAgents($: EngineInterface) {
     if (agents.has(x.agent)) continue
     let type: string | undefined
     if (BUILT_IN.includes(x.agent)) type = x.agent
-    else if ((await $.fs.exists(`${dir}/agents/${x.agent}.md`)) || (await $.fs.exists(`.claude/agents/${x.agent}.md`))) {
+    // The workspace's own agents only with `projectAgents`: an untrusted repo must not be able
+    // to pull delegation into an agent it wrote.
+    else if (
+      (await $.fs.exists(`${dir}/agents/${x.agent}.md`)) ||
+      (config.projectAgents && (await $.fs.exists(`.claude/agents/${x.agent}.md`)))
+    ) {
       type = x.agent
       custom.add(x.agent)
     } else if (SHIPPED.includes(x.agent)) type = `agent-boxes:${x.agent}`
@@ -110,22 +154,73 @@ const executors = () =>
     isCustom: custom.has(x.agent),
   }))
 
-// Claude's windows from the session; Codex's and agy's from the side bar's scan.
-async function quota($: EngineInterface): Promise<Quota> {
-  const q: Quota = {}
-  try {
-    q.claude = claudeWindows((await $.session.usage()).rateLimits)
-  } catch {
-    // no usage yet; Claude counts as unknown
+// Codex's and agy's readings from a scan: a fresh box replaces the reading, a stale one keeps
+// it (marked stale), a tool that is not installed or has no usage (`{"5h": null, "7d": null}`)
+// drops it: such a pool is unknown, not healthy.
+const hasUsage = (w: Windows | undefined): w is Windows =>
+  typeof w?.['5h']?.used === 'number' || typeof w?.['7d']?.used === 'number'
+
+export function takeScan({ readings, limited }: Book, scan: Scan, now: number) {
+  const put = (pool: Pool, box: ToolBox | undefined, w: Windows | undefined) => {
+    const old = readings.get(pool)
+    if (!box || box.installed === false) readings.delete(pool)
+    else if (box.stale) {
+      if (old && !old.isStale) readings.set(pool, { ...old, isStale: true })
+    } else if (hasUsage(w)) {
+      readings.set(pool, { w, atMs: now, isStale: false })
+      const hit = limited.get(pool)
+      const isNews = hit !== undefined && JSON.stringify(w) !== hit.seen && now - hit.atMs >= CLEAR_AFTER_MS
+      if (isNews && !poolState(pool, w, now).isOut) limited.delete(pool)
+    } else readings.delete(pool)
   }
-  const s = scanned
-  if (s && !s.codex.stale && s.codex.installed !== false && s.codex.windows) q.codex = s.codex.windows
-  if (s && !s.agy.stale && s.agy.installed !== false) {
-    const gemini = s.agy.groups?.gemini ?? s.agy.windows
-    if (gemini) q.agy = gemini
-    if (s.agy.groups?.['claude/gpt']) q['agy-claude'] = s.agy.groups['claude/gpt']
+  put('codex', scan.codex, scan.codex?.windows)
+  put('agy', scan.agy, scan.agy?.groups?.gemini ?? scan.agy?.windows)
+  put('agy-claude', scan.agy, scan.agy?.groups?.['claude/gpt'])
+}
+
+// The book's quota: each reading while fresh (a stale box's only STALE_MS, Claude's
+// CLAUDE_KEEP_MS); a pool a relay found rate-limited is out for its cooldown.
+export function bookQuota({ readings, limited }: Book, now: number): Quota {
+  const q: Quota = {}
+  for (const [pool, r] of readings) {
+    const keep = pool === 'claude' ? CLAUDE_KEEP_MS : r.isStale ? STALE_MS : FRESH_MS
+    if (now - r.atMs <= keep) q[pool] = r.w
+  }
+  for (const [pool, hit] of limited) {
+    if (now - hit.atMs >= COOLDOWN_MS) limited.delete(pool)
+    else q[pool] = { ...q[pool], rateLimited: true }
   }
   return q
+}
+
+/** A relay's report that ends with the line `Result: rate-limited`. */
+export const isRateLimited = (text: string) => RATE_LIMITED.test(text.trimEnd())
+
+// Claude's windows from the session (else its last reading); Codex's and agy's from the scan.
+async function quota($: EngineInterface, now: number): Promise<Quota> {
+  try {
+    const w = claudeWindows((await $.session.usage()).rateLimits)
+    if (hasUsage(w)) book.readings.set('claude', { w, atMs: now, isStale: false })
+  } catch {
+    // no usage yet: the last reading, if any
+  }
+  return bookQuota(book, now)
+}
+
+// A background error, logged once per category (ids and numbers stripped) per LOG_EVERY_MS.
+async function logOnce($: EngineInterface, what: string, err: unknown) {
+  const text = `agent-boxes: ${what}: ${String(err)}`
+  const key = text.replace(/\b[0-9a-f]{6,}(-[0-9a-f]+)*\b/gi, '#').replace(/\d+/g, '#')
+  let now = 0
+  try {
+    now = await $.clock.now()
+  } catch {
+    // no clock: log it
+  }
+  const at = logged.get(key)
+  if (at !== undefined && now - at < LOG_EVERY_MS) return
+  logged.set(key, now)
+  $.ui.log(text)
 }
 
 // The category by keywords, else by a small model for prompts long enough to be a new task.
@@ -134,31 +229,50 @@ async function categorize($: EngineInterface, text: string): Promise<Category | 
   if (found) return found
   const words = text.trim().split(/\s+/).length
   if (words <= REPLY_WORDS) return undefined
-  if (!config.classify) return categoryById('general')
+  // A blocking call on every prompt: only when a finer label could change the placement.
+  if (!config.classify || words <= CLASSIFY_WORDS) return categoryById('general')
   try {
     const ids = CATEGORIES.map(c => `${c.id} (${c.title})`).join(', ')
     const r = await $.model.complete({
       model: config.classifyModel,
       maxTokens: 20,
-      timeoutMs: 5000,
+      timeoutMs: CLASSIFY_TIMEOUT_MS,
       system: 'You sort a request to a coding agent into one category. Reply with the category id alone.',
       prompt: `Categories: ${ids}, general.\n\nRequest:\n<<<${text.slice(0, 2000)}>>>`,
     })
-    const id = r.isAnswered ? r.text.trim().toLowerCase().replace(/[^a-z]/g, '') : ''
-    return categoryById(id)
+    return categoryById(r.isAnswered ? categoryIdIn(r.text) : '')
   } catch {
     return categoryById('general')
   }
 }
 
+// The classifier's reply: a category id alone, or a JSON object with one (`{"category": "x"}`).
+function categoryIdIn(text: string) {
+  const known = new Set([...CATEGORIES.map(c => c.id), 'general'])
+  const obj = firstJson(text)
+  const v = obj && (obj.category ?? obj.id)
+  if (typeof v === 'string' && known.has(v.trim().toLowerCase())) return v.trim().toLowerCase()
+  return text.toLowerCase().match(/[a-z]+/g)?.find(w => known.has(w)) ?? ''
+}
+
 // The router box: the mode and best-placed pool, then the last routed prompt's pick. register.tsx
-// also calls it after each scan, for the best-placed line.
+// also calls it after each scan (the current one, stale boxes marked), for the best-placed line;
+// a scan that changes no reading returns at once.
 export async function refresh($: EngineInterface, scan?: Scan) {
-  if (scan) scanned = scan
+  const now = await $.clock.now()
+  if (scan) {
+    takeScan(book, scan, now)
+    // What the box would draw from now, expiry of stale readings and cooldowns included.
+    const live = bookQuota(book, now)
+    delete live.claude
+    const sig = JSON.stringify([config.mode, last?.atMs, live])
+    if (sig === scanSig) return
+    scanSig = sig
+  }
   const r = last?.route
   const next = config.mode === 'off' ? null : {
     mode: config.mode,
-    lead: leadLine(await quota($), await $.clock.now(), executors()),
+    lead: leadLine(await quota($, now), now, executors()),
     category: r?.category.id ?? '',
     size: r?.size ?? '',
     pick: r?.pick ? (last?.place.inLoop ? `this loop (${r.pick.label})` : r.pick.label) : '',
@@ -188,7 +302,7 @@ async function log($: EngineInterface, entry: object) {
     }
   } catch (err) {
     pending = []
-    $.ui.log(`agent-boxes: router history: ${String(err)}`)
+    await logOnce($, 'router history', err)
   } finally {
     writing = false
   }
@@ -197,7 +311,7 @@ async function log($: EngineInterface, entry: object) {
 // What /route prints: the last pick with every candidate's score, the quota and the mode.
 async function report($: EngineInterface) {
   const now = await $.clock.now()
-  const q = await quota($)
+  const q = await quota($, now)
   const lines = [`router · mode ${config.mode} · ${quotaLine(q, now)}`]
   if ((await $.env.get('CLAUDE_CODE_SUBAGENT_MODEL_FORCE')) === '1') {
     lines.push('CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1 is set: Claude model picks are overridden by CLAUDE_CODE_SUBAGENT_MODEL.')
@@ -217,14 +331,27 @@ async function report($: EngineInterface) {
   return lines.join('\n')
 }
 
+// The executor a spawn runs: its agent type alone when only one executor has it; when several
+// share it (general-purpose on Haiku, Sonnet, Opus), the one whose model the spawn names (alias,
+// or a model id of that family). A shared type with no model names none.
+function executorOf(subagentType: string, model: string | undefined, all = executors()): Executor | undefined {
+  if (subagentType === 'general-purpose' && !model) return undefined
+  const same = all.filter(x => x.agent === subagentType)
+  if (same.length <= 1) return same[0]
+  if (!model) return undefined
+  const m = model.toLowerCase()
+  return same.find(x => x.model === m) ?? same.find(x => x.model && m.split(/[^a-z0-9]+/).includes(x.model))
+}
+
 // steer mode: a spawn whose pool is out goes to the best executor of the last prompt's category.
 function steer(subagentType: string, model: string | undefined, quotaNow: Quota, now: number): Executor | undefined {
   const all = executors()
-  const asked = all.find(x => x.agent === subagentType && (!x.model || !model || x.model === model))
+  const asked = executorOf(subagentType, model, all)
   if (!asked || named.has(asked.id)) return undefined
   const category = last?.route.category ?? categoryById('general')
   const r = route(category, last?.route.size ?? 'medium', quotaNow, now, all, config)
-  const isOut = r.scored.find(s => s.executor.id === asked.id)?.out ?? (asked.pool === 'claude' && r.isClaudeLow)
+  // Its own pool's standing, ranked in this category or not (a codex-builder spawn while Codex is out).
+  const isOut = poolState(asked.pool, quotaNow[asked.pool], now).isOut
   if (!isOut || !r.pick || r.pick.id === asked.id) return undefined
   return r.pick
 }
@@ -233,7 +360,9 @@ function steer(subagentType: string, model: string | undefined, quotaNow: Quota,
 
 export async function startRouter($: EngineInterface, dir: string) {
   claudeDir = dir
-  scanned = null
+  book = newBook()
+  scanSig = ''
+  logged = new Map()
   last = undefined
   spawned = new Map()
   prompt = undefined
@@ -264,20 +393,26 @@ export async function routeNote($: EngineInterface, e: PromptSubmitInput): Promi
   let note: string | undefined
   try {
     const now = await $.clock.now()
-    const category = await categorize($, e.text)
+    // "ok, and the tests", "now push it": within the follow-up window, the same task.
+    evictSpawns(now)
     const mentioned = namedIn(e.text, executors())
+    const follows = last !== undefined && now - last.atMs < FOLLOW_MS && isContinuation(e.text)
+    const category = follows ? undefined : await categorize($, e.text)
     named = new Set(mentioned.map(x => x.id))
     // This reply is the best signal of how the last prompt's work went: a new task grades it
     // either way, a continuation only when it says something about the result.
     const verdict = outcomeOf(e.text)
     if (prompt && !prompt.isGraded && (category || verdict !== 'unknown')) await grade($, verdict, 'reply')
+    // A reply that only names an executor ("use architect", "ok, on Opus") continues the task, and
+    // still gets the note: the user's pick wins.
+    if (!category && mentioned.length) note = namedNote(mentioned)
     if (!category && prompt) {
       prompt.isOpen = true
       prompt.turnAtMs = now
       prompt.spawns = 0
     }
     if (category) {
-      const q = await quota($)
+      const q = await quota($, now)
       const prev = last && now - last.atMs < FOLLOW_MS ? last.route.pick?.id : undefined
       const r = route(category, sizeOf(e.text), q, now, executors(), config, prev)
       const loop = await mainLoop($)
@@ -304,7 +439,7 @@ export async function routeNote($: EngineInterface, e: PromptSubmitInput): Promi
     }
     await refresh($)
   } catch (err) {
-    $.ui.log(`agent-boxes: router: ${String(err)}`)
+    await logOnce($, 'router', err)
   }
   return note
 }
@@ -315,12 +450,13 @@ const isPlain = (e: AgentSpawnInput) => !e.fork && !e.resume && !e.isTeammate &&
 export async function steered($: EngineInterface, e: AgentSpawnInput): Promise<AgentSpawnInput> {
   if (config.mode !== 'steer' || !isPlain(e)) return e
   try {
-    const to = steer(e.subagentType, e.model, await quota($), await $.clock.now())
+    const now = await $.clock.now()
+    const to = steer(e.subagentType, e.model, await quota($, now), now)
     if (!to) return e
     $.ui.toast(`⇄ ${e.subagentType} → ${to.agent} (${last?.route.why ?? 'quota'})`)
     return { ...e, subagentType: to.agent, model: to.model }
   } catch (err) {
-    $.ui.log(`agent-boxes: steer: ${String(err)}`)
+    await logOnce($, 'steer', err)
     return e
   }
 }
@@ -332,7 +468,8 @@ export async function spawnedAgent($: EngineInterface, asked: AgentSpawnInput, r
   const category = last?.route.category.id ?? ''
   const promptId = prompt?.isOpen ? prompt.id : undefined
   if (prompt?.isOpen) prompt.spawns++
-  spawned.set(done.agentId, { atMs, category, promptId })
+  const pool = executorOf(ran.subagentType, ran.model ?? done.model)?.pool
+  spawned.set(done.agentId, { atMs, category, promptId, pool })
   await log($, {
     atMs,
     event: 'spawn',
@@ -346,12 +483,41 @@ export async function spawnedAgent($: EngineInterface, asked: AgentSpawnInput, r
   })
 }
 
-export async function agentDone($: EngineInterface, agentId: string | undefined) {
+// Drops spawns that never reported an end, so the map can't grow all session.
+function evictSpawns(now: number) {
+  for (const [id, run] of spawned) if (now - run.atMs > SPAWN_KEEP_MS) spawned.delete(id)
+}
+
+// A routed spawn ended. `answer` is turn.complete's `e.answer` (the report it handed back); left
+// out, the agent's last reply is read. A relay whose report ends `Result: rate-limited` puts its
+// pool out for COOLDOWN_MS, so the next prompt goes to the fallback.
+export async function agentDone($: EngineInterface, agentId: string | undefined, answer?: string) {
   const run = agentId ? spawned.get(agentId) : undefined
-  if (!run || !agentId) return
-  spawned.delete(agentId)
+  if (agentId) spawned.delete(agentId)
   const atMs = await $.clock.now()
-  await log($, { atMs, event: 'done', promptId: run.promptId, agentId, category: run.category, ms: atMs - run.atMs })
+  evictSpawns(atMs)
+  if (!run || !agentId) return
+  let text = answer
+  if (text === undefined && run.pool && run.pool !== 'claude') {
+    try {
+      const said = await $.session.messages({ agentId })
+      if (Array.isArray(said)) text = [...said].reverse().find(m => m.role === 'assistant' && m.text)?.text
+    } catch {
+      // gone already: no verdict
+    }
+  }
+  const isLimited = run.pool !== undefined && text !== undefined && isRateLimited(text)
+  if (isLimited) markLimited(book, run.pool!, atMs)
+  await log($, {
+    atMs,
+    event: 'done',
+    promptId: run.promptId,
+    agentId,
+    category: run.category,
+    ms: atMs - run.atMs,
+    ...(isLimited ? { rateLimited: run.pool } : {}),
+  })
+  if (isLimited) await refresh($)
 }
 
 // A main turn on the routed prompt ended (the first, or one after a continuing reply): how it ran

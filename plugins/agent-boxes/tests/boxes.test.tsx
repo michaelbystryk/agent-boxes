@@ -73,6 +73,13 @@ type Setup = {
   hasAgentFiles?: boolean
   // What agent.list answers; by default a running reviewer and a finished scout.
   agents?: AgentInfo[]
+  agentMessages?: (id: string) => Promise<SessionMessage[]>
+  runScan?: (clock: MockClock, index: number) => Promise<object>
+  taskListError?: string
+  taskReadMs?: number
+  spawnMs?: number
+  turnMs?: number
+  composeMs?: number
 }
 
 type World = {
@@ -85,6 +92,8 @@ type World = {
   logs: string[]
   writes: Map<string, string>
   toasts: string[]
+  prompts: string[]
+  taskReads: () => number
 }
 
 const TOOL_FOLDERS = ['/home/u/.codex', '/home/u/.gemini/antigravity-cli']
@@ -100,6 +109,8 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
   const clock = mock.clock(on)
   let completes = 0
   let lists = 0
+  let taskReads = 0
+  const prompts: string[] = []
   const logs: string[] = []
   const writes = new Map<string, string>()
   const taskDir = '/home/u/.claude/tasks/sess-1'
@@ -128,16 +139,22 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
       (setup.hasAgentFiles === true && /\/agents\/[\w-]+\.md$/.test(unix(e.path))) ||
       writes.has(unix(e.path)),
   }))
-  on('fs.list', () => ({
-    value: Object.keys(tasks).map(name => ({ name, kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
-  }))
-  on('fs.read', (_$, e) =>
-    writes.has(unix(e.path))
-      ? { value: writes.get(unix(e.path))! }
-      : unix(e.path) === configPath && config !== undefined
-      ? { value: typeof config === 'string' ? config : JSON.stringify(config) }
-      : { value: JSON.stringify(tasks[unix(e.path).slice(taskDir.length + 1)]) },
-  )
+  on('fs.list', (_$, e) => {
+    if (unix(e.path) === taskDir) {
+      taskReads++
+      if (setup.taskListError) return { deny: setup.taskListError }
+    }
+    return { value: Object.keys(tasks).map(name => ({ name, kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })) }
+  })
+  on('fs.read', async (_$, e) => {
+    if (writes.has(unix(e.path))) return { value: writes.get(unix(e.path))! }
+    if (unix(e.path) === configPath && config !== undefined) {
+      return { value: typeof config === 'string' ? config : JSON.stringify(config) }
+    }
+    const value = JSON.stringify(tasks[unix(e.path).slice(taskDir.length + 1)])
+    if (setup.taskReadMs) await clock.sleep(setup.taskReadMs)
+    return { value }
+  })
   on('fs.write', (_$, e) => {
     writes.set(unix(e.path), e.text)
     return { value: undefined }
@@ -151,21 +168,28 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
     ],
     }
   })
-  on('session.messages', (_$, e) => ({
+  on('session.messages', async (_$, e) => ({
     value:
-      e.agentId === 'a1'
+      e.agentId && setup.agentMessages ? await setup.agentMessages(e.agentId) : e.agentId === 'a1'
         ? [{ role: 'assistant', text: '', toolUses: [{ tool_use_id: 't1', tool: 'Read', input: { file_path: 'src/parser.ts' } }] }]
         : setup.messages ?? [
             { role: 'user', text: 'add a next box', toolUses: [] },
             { role: 'assistant', text: 'Done. Restart?', toolUses: [] },
           ],
   }))
-  on('model.complete', async () => {
+  on('model.complete', async (_$, e) => {
     completes++
+    prompts.push(e.prompt)
+    let text: string
+    try {
+      text = setup.complete ? await setup.complete(clock) : BRIEF
+    } catch (err) {
+      return { deny: String(err) }
+    }
     return {
       value: {
         isAnswered: true,
-        text: setup.complete ? await setup.complete(clock) : BRIEF,
+        text,
         usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
       },
     }
@@ -189,7 +213,7 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
     return {
       value: {
         exitCode: (isCheck && old.includes(e.argv[0] ?? '')) || failing.includes(e.argv[0] ?? '') ? 1 : 0,
-        stdout: isCheck ? '' : JSON.stringify(scan),
+        stdout: isCheck ? '' : JSON.stringify(isScan && setup.runScan ? await setup.runScan(clock, scans().length) : scan),
         stderr: '',
         isStdoutTruncated: false,
         isStderrTruncated: false,
@@ -209,10 +233,19 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
     return <Text>engine band</Text>
   })
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
-  on('turn.complete', (_$, e) => ({ text: e.answer }))
+  on('turn.complete', async (_$, e) => {
+    if (setup.turnMs) await clock.sleep(setup.turnMs)
+    return { text: e.answer }
+  })
   on('prompt.submit', (_$, e) => ({ text: e.text, context: e.context }))
-  on('prompt.compose', () => ({ sections: [] }))
-  on('agent.spawn', (_$, e) => ({ model: e.model ?? 'claude-sonnet-5-5', agentId: 'ag-1' }))
+  on('prompt.compose', async () => {
+    if (setup.composeMs) await clock.sleep(setup.composeMs)
+    return { sections: [] }
+  })
+  on('agent.spawn', async (_$, e) => {
+    if (setup.spawnMs) await clock.sleep(setup.spawnMs)
+    return { model: e.model ?? 'claude-sonnet-5-5', agentId: 'ag-1' }
+  })
   on('ui.toast', (_$, e) => {
     toasts.push(e.text)
     return { value: undefined }
@@ -224,7 +257,7 @@ async function start($: Engine, on: On, setup: Setup = {}): Promise<World> {
   })
   await $.session.start({ cwd: '.', surface: 'terminal', isInteractive: true })
   await clock.settle()
-  return { argvs, clock, scans, checks, completes: () => completes, lists: () => lists, logs, writes, toasts }
+  return { argvs, clock, scans, checks, completes: () => completes, lists: () => lists, logs, writes, toasts, prompts, taskReads: () => taskReads }
 }
 
 test("the claude box lists the chat's headless bench runs", async ($, on) => {
@@ -356,10 +389,10 @@ test('the router box shows its mode and the best-placed pool before any prompt',
 test('a user prompt gets a hidden route note, and the pick shows in the router box', async ($, on) => {
   await start($, on, SHORT)
   const note = await submit($, SHADER)
-  expect(note).toMatch(/\[router\].*shaders/)
+  expect(note).toMatch(/\[router\].*shader/)
   // Claude's 5h is at 93%: Opus moves to agy's Claude group
-  expect(note).toMatch(/Opus 5.5 via agy/)
-  expect(note).toMatch(/Claude is near its limit/)
+  expect(note).toMatch(/→ agent-boxes:agy-opus/)
+  expect(note).toMatch(/Opus 5.5 out: Claude 5h 93%/)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /Opus 5\.5 via agy/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /shader \(medium\)/ })).toBeDefined()
@@ -373,7 +406,7 @@ test('a user prompt gets a hidden route note, and the pick shows in the router b
 
 test('without agent files it routes to its own relays and general-purpose', async ($, on) => {
   await start($, on, SHORT)
-  expect(await submit($, SHADER)).toMatch(/subagent_type "agent-boxes:agy-opus"/)
+  expect(await submit($, SHADER)).toMatch(/→ agent-boxes:agy-opus/)
   const compose = await $.prompt.compose({
     model: 'claude-opus-5-5',
     promptModel: 'claude-opus-5-5',
@@ -389,7 +422,7 @@ test('without agent files it routes to its own relays and general-purpose', asyn
 
 test("the user's own agent definitions win over the relays", async ($, on) => {
   await start($, on, { ...SHORT, hasAgentFiles: true })
-  expect(await submit($, SHADER)).toMatch(/subagent_type "agy-opus"/)
+  expect(await submit($, SHADER)).toMatch(/→ agy-opus/)
 })
 
 test('a short reply gets no note and no model call', async ($, on) => {
@@ -449,7 +482,7 @@ test('advise mode never rewrites a spawn, and logs it', async ($, on) => {
   expect((await spawn($)).model).toBe('claude-sonnet-5-5')
   expect(w.toasts).toEqual([])
   const [route, spawned] = history(w)
-  expect(route).toMatchObject({ event: 'route', inLoop: false, mainModel: 'claude-opus-5-5', policy: 2 })
+  expect(route).toMatchObject({ event: 'route', inLoop: false, mainModel: 'claude-opus-5-5', policy: 3 })
   expect(spawned).toMatchObject({ event: 'spawn', agent: 'worker', promptId: route.promptId })
 })
 
@@ -463,8 +496,7 @@ test('parallel spawns each get a history line', async ($, on) => {
 test("a Claude pick on this chat's model is done in the loop, and the history grades it", async ($, on) => {
   const w = await start($, on, { scan: QUOTA_SCAN })
   const note = await submit($, SHADER)
-  expect(note).toMatch(/Do it in this loop/)
-  expect(note).not.toMatch(/Suggested executor/)
+  expect(note).toBe('')
   await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
   await submit($, "that's still broken, the glow is gone")
   await submit($, SHADER)
@@ -642,16 +674,59 @@ test('a timed-out scan keeps the interpreter and the last boxes', async ($, on) 
   expect(argvs.filter(a => a[2] === '-c').length).toBe(1)
 })
 
-test('no scan runs while the pane is not placed', async ($, on) => {
+test('an unopened pane still scans quota each minute, without task or agent reads', async ($, on) => {
   const placed = { is: false }
-  const { argvs, clock, scans } = await start($, on, { placed })
-  await clock.advance(15000)
-  expect(argvs.length).toBe(0)
+  const { clock, scans, lists, taskReads } = await start($, on, { ...SHORT, placed, config: { brief: false } })
+  expect(scans().length).toBe(1)
+  expect(await submit($, SHADER)).toMatch(/Opus.*agy/)
+  await clock.advance(55000)
+  expect(scans().length).toBe(1)
+  await clock.advance(5000)
+  expect(scans().length).toBe(2)
+  expect(lists()).toBe(0)
+  expect(taskReads()).toBe(0)
   // Placed: its first render scans at once.
   placed.is = true
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await clock.settle()
-  expect(scans().length).toBe(1)
+  expect(scans().length).toBe(3)
+  expect(lists()).toBe(1)
+  expect(taskReads()).toBe(1)
+  await clock.advance(5000)
+  expect(scans().length).toBe(4)
+  await ui.unmount()
+})
+
+test('hidden scan backoff skips five-second ticks without restarting the minute timer', async ($, on) => {
+  const w = await start($, on, { placed: { is: false }, config: { brief: false }, scanFailsFrom: 1 })
+  await w.clock.advance(60000) // The second scan fails, requesting one skipped tick.
+  expect(w.scans().length).toBe(2)
+  await w.clock.advance(60000) // The minute expires; skip just this tick.
+  expect(w.scans().length).toBe(2)
+  await w.clock.advance(5000)
+  expect(w.scans().length).toBe(3)
+  await w.clock.advance(60000) // The next failure requests two skipped ticks.
+  expect(w.scans().length).toBe(3)
+  await w.clock.advance(5000)
+  expect(w.scans().length).toBe(3)
+  await w.clock.advance(5000)
+  expect(w.scans().length).toBe(4)
+})
+
+test('opening the pane bypasses scan backoff and a success restores the normal cadence', async ($, on) => {
+  const placed = { is: false }
+  const setup: Setup = { placed, config: { brief: false }, scanFailsFrom: 1 }
+  const w = await start($, on, setup)
+  await w.clock.advance(60000)
+  expect(w.scans().length).toBe(2)
+  setup.scanFailsFrom = undefined
+  placed.is = true
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  expect(w.scans().length).toBe(3)
+  expect(await ui.find({ type: 'Text', text: /retrying/ })).toBeUndefined()
+  await w.clock.advance(5000)
+  expect(w.scans().length).toBe(4)
   await ui.unmount()
 })
 
@@ -778,6 +853,104 @@ test('/clear drops the old conversation summary', async ($, on) => {
   await ui.unmount()
 })
 
+test('/clear discards a task read in flight and polling reads the new conversation', async ($, on) => {
+  const tasks: Record<string, object> = { '1.json': { id: '1', subject: 'Old conversation task', status: 'in_progress' } }
+  const setup: Setup = { tasks, taskReadMs: 1000, config: { brief: false } }
+  const w = await start($, on, setup)
+  expect(w.taskReads()).toBe(1)
+  await $.session.end({ reason: 'clear', sessionId: 'sess-1', resume: { id: 'sess-1' } })
+  delete tasks['1.json']
+  await w.clock.advance(1000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Old conversation task/ })).toBeUndefined()
+  expect(w.scans().length).toBe(0) // The old poll must not continue into a scan after its task read.
+  setup.taskReadMs = 0
+  tasks['2.json'] = { id: '2', subject: 'New conversation task', status: 'in_progress' }
+  await w.clock.advance(4000)
+  expect(await ui.find({ type: 'Text', text: /New conversation task/ })).toBeDefined()
+  expect(w.scans().length).toBe(1)
+  await ui.unmount()
+})
+
+test('/clear discards a scan in flight, including its cached result and relay tracking', async ($, on) => {
+  const clean = { ...SCAN, codex: { ...SCAN.codex, agents: [] } }
+  const setup: Setup = {
+    ...RELAYS,
+    config: { brief: false },
+    runScan: async (clock, index) => {
+      if (index === 2) {
+        await clock.sleep(1000)
+        return { ...SCAN, codex: { ...SCAN.codex, agents: [{ depth: 0, text: 'Old conversation scan', via: 'r1' }] } }
+      }
+      return clean
+    },
+  }
+  const w = await start($, on, setup)
+  await w.clock.advance(5000)
+  expect(w.scans().length).toBe(2)
+  await $.session.end({ reason: 'clear', sessionId: 'sess-1', resume: { id: 'sess-1' } })
+  await w.clock.advance(1000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Old conversation scan/ })).toBeUndefined()
+  setup.scanFailsFrom = 2
+  await w.clock.advance(4000)
+  expect(w.scans().length).toBe(3)
+  expect(await ui.find({ type: 'Text', text: /scan (slow|failed), retrying/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Old conversation scan|reporting back/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /Codex smoke check · starting…/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('/clear discards a late scan failure without backing off the new conversation', async ($, on) => {
+  const w = await start($, on, {
+    config: { brief: false },
+    runScan: async (clock, index) => {
+      if (index === 2) {
+        await clock.sleep(1000)
+        throw new Error('process timed out')
+      }
+      return SCAN
+    },
+  })
+  await w.clock.advance(5000)
+  await $.session.end({ reason: 'clear', sessionId: 'sess-1', resume: { id: 'sess-1' } })
+  await w.clock.advance(1000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /retrying/ })).toBeUndefined()
+  await w.clock.advance(4000)
+  expect(w.scans().length).toBe(3)
+  await ui.unmount()
+})
+
+test('/clear discards post-hook work for an old spawn, turn and prompt composition', async ($, on) => {
+  const setup: Setup = { ...SHORT, spawnMs: 1000, turnMs: 1000, composeMs: 1000 }
+  const w = await start($, on, setup)
+  await submit($, SHADER)
+  const composition = {
+    model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['terminal' as const],
+    tools: ['Agent', 'Bash'], outputStyle: null, traits: [],
+  }
+  const spawned = spawn($)
+  const completed = $.turn.complete({ answer: 'old answer', durationMs: 1, isAborted: false, turnId: 'old', reason: 'answer' })
+  const composed = $.prompt.compose(composition)
+  await w.clock.settle()
+  await $.session.end({ reason: 'clear', sessionId: 'sess-1', resume: { id: 'sess-1' } })
+  await w.clock.advance(1000)
+  expect((await spawned).agentId).toBe('ag-1')
+  expect((await completed).text).toBe('old answer')
+  expect((await composed).sections).toEqual([])
+  expect(w.completes()).toBe(1)
+  expect(history(w).filter(e => e.event === 'spawn' || e.event === 'turn')).toEqual([])
+  setup.spawnMs = setup.turnMs = setup.composeMs = 0
+  await submit($, SHADER)
+  await spawn($)
+  await $.turn.complete({ answer: 'new answer', durationMs: 1, isAborted: false, turnId: 'new', reason: 'answer' })
+  await w.clock.settle()
+  expect(w.completes()).toBe(2)
+  expect(history(w).filter(e => e.event === 'spawn' || e.event === 'turn').length).toBe(2)
+  expect((await $.prompt.compose(composition)).sections.length).toBe(1)
+})
+
 test('a python path with spaces is one argument', async ($, on) => {
   const { checks } = await start($, on, {
     folders: [...TOOL_FOLDERS, '/opt/My Env/bin/python'],
@@ -824,4 +997,145 @@ test('macOS: the xcode stub python3 is skipped without the developer tools', asy
   expect(argvs[0]).toEqual(['/usr/bin/xcode-select', '-p'])
   expect(argvs.some(a => a[0] === 'python3')).toBe(false)
   expect(scans()[0]?.[0]).toBe('python')
+})
+
+// The test runner freezes hooks at startup and imports a separate copy of register.tsx, so it
+// cannot simulate re-registration of the live plugin. Exercise polling overlap without reload.
+test('a slow scan keeps the poll lock and preserves its result after a later failure', async ($, on) => {
+  const w = await start($, on, {
+    config: { brief: false },
+    scanFailsFrom: 1,
+    runScan: async clock => {
+      await clock.sleep(12000)
+      return { ...SCAN, codex: { ...SCAN.codex, agents: [{ depth: 0, text: 'current scan' }] } }
+    },
+  })
+  expect(w.scans().length).toBe(1)
+  await w.clock.advance(10000)
+  expect(w.scans().length).toBe(1)
+  await w.clock.advance(5000)
+  expect(w.scans().length).toBe(2)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /current scan/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /scan (slow|failed), retrying/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('task read errors and a vanished agent do not block other agents or quota scans', async ($, on) => {
+  const w = await start($, on, {
+    config: { brief: false },
+    taskListError: 'task directory unavailable',
+    agents: [
+      { id: 'gone', description: 'Gone', type: 'worker', status: 'running' },
+      { id: 'live', description: 'Still working', type: 'worker', status: 'running' },
+    ],
+    agentMessages: async id => {
+      if (id === 'gone') throw new Error('agent gone not found')
+      return [
+        { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'old', tool: 'Read', input: { path: 'old.ts' } }] },
+        { role: 'assistant', text: '', toolUses: [
+          { tool_use_id: 'first', tool: 'Read', input: { path: 'first.ts' } },
+          { tool_use_id: 'last', tool: 'Edit', input: { path: 'latest.ts' } },
+        ] },
+        { role: 'assistant', text: 'still working', toolUses: [] },
+      ]
+    },
+  })
+  expect(w.scans().length).toBe(1)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Still working/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /↳ Edit latest\.ts/ })).toBeDefined()
+  await w.clock.advance(5000)
+  expect(w.scans().length).toBe(2)
+  await ui.unmount()
+})
+
+test('brief errors with changing ids, paths and counters log once per 30 minutes', async ($, on) => {
+  let count = 0
+  const w = await start($, on, {
+    complete: async () => {
+      count++
+      const id = ['alpha', 'bravo', 'charlie'][count - 1] ?? 'delta'
+      throw new Error(`rate limit for request req-${count}, agentId=${id}: "/tmp/${id} dir/reply.json" 0x${count.toString(16)} retry ${count}`)
+    },
+  })
+  const finish = () => $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: `t${count}`, reason: 'answer' })
+  await finish()
+  await w.clock.settle()
+  expect(w.logs.filter(x => /brief failed/.test(x)).length).toBe(1)
+  await w.clock.advance(30 * 60000)
+  await finish()
+  await w.clock.settle()
+  expect(w.logs.filter(x => /brief failed/.test(x)).length).toBe(2)
+})
+
+test('error categories are capped and the oldest category can log again after eviction', async ($, on) => {
+  let category = 'aa'
+  const w = await start($, on, { complete: async () => { throw new Error(`failure ${category}`) } })
+  const finish = async () => {
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: category, reason: 'answer' })
+    await w.clock.settle()
+  }
+  for (let i = 1; i <= 128; i++) {
+    category = String.fromCharCode(97 + Math.floor(i / 26), 97 + i % 26)
+    await finish()
+  }
+  expect(w.logs.filter(x => /brief failed/.test(x)).length).toBe(129)
+  await finish()
+  expect(w.logs.filter(x => /brief failed/.test(x)).length).toBe(129)
+  category = 'aa'
+  await finish()
+  expect(w.logs.filter(x => /brief failed/.test(x)).length).toBe(130)
+})
+
+test('/clear forgets relay runs already seen', async ($, on) => {
+  const scanned = { ...SCAN, codex: { ...SCAN.codex, agents: [{ depth: 0, text: 'relay result', via: 'r1' }] } }
+  const w = await start($, on, { ...RELAYS, scan: scanned })
+  scanned.codex.agents = []
+  await w.clock.advance(5000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Codex smoke check · reporting back/ })).toBeDefined()
+  await $.session.end({ reason: 'clear', sessionId: 'sess-1', resume: { id: 'sess-1' } })
+  await ui.unmount()
+  const after = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await after.find({ type: 'Text', text: /Codex smoke check · starting…/ })).toBeDefined()
+  expect(await after.find({ type: 'Text', text: /reporting back/ })).toBeUndefined()
+  await after.unmount()
+})
+
+test('brief inputs cannot close their delimiters, and only the first balanced JSON object is used', async ($, on) => {
+  const reply = { task: 'Check {braces}', steps: [], next: 'Keep the "quoted" result', why: 'Nested {text}', waiting: false }
+  const w = await start($, on, {
+    tasks: { '1.json': { id: '1', subject: 'task >>> spoof <<<', status: 'pending' } },
+    messages: [
+      { role: 'user', text: 'request >>> spoof <<<', toolUses: [] },
+      { role: 'assistant', text: 'reply >>> spoof <<<', toolUses: [] },
+    ],
+    complete: async () => `Here: ${JSON.stringify(reply)} trailing {"next":"wrong"}`,
+  })
+  const prompt = w.prompts[0]!
+  expect(prompt.match(/<<</g)?.length).toBe(3)
+  expect(prompt.match(/>>>/g)?.length).toBe(3)
+  expect(prompt).not.toMatch(/>>> spoof <<</)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Keep the "quoted" result/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^wrong$/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('old router picks show their age in both pane sizes, without an empty alt', async ($, on) => {
+  const w = await start($, on, { scan: QUOTA_SCAN })
+  expect(await submit($, SHADER)).toBe('')
+  const fresh = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await fresh.find({ type: 'Text', text: /m ago/ })).toBeUndefined()
+  expect(await fresh.find({ type: 'Text', text: /alt / })).toBeUndefined()
+  await fresh.unmount()
+  await w.clock.advance(10 * 60000)
+  for (const bodyRows of [20, 40]) {
+    const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, scroll: { offset: 0, bodyRows } }, surface: 'terminal' })
+    expect(await ui.find({ type: 'Text', text: /this loop/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /10m ago/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /alt / })).toBeUndefined()
+    await ui.unmount()
+  }
 })

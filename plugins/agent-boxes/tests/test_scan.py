@@ -1,12 +1,15 @@
 """Scanner regressions; run with python -E -m unittest tests/test_scan.py -v."""
 import json
 import os
+import re
 import runpy
 import signal
+import sqlite3
 import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -50,6 +53,44 @@ class Files(unittest.TestCase):
         codex._TRANSCRIPTS.clear()
         codex._READ_BUDGET = None
         return codex.transcript_data(str(path), 0)
+
+
+class TimestampTests(unittest.TestCase):
+    def check_timestamps(self):
+        base = datetime(2026, 10, 17, 12, tzinfo=timezone.utc).timestamp()
+        fractions = (("", 0), (".1", 0.1), (".12", 0.12), (".123", 0.123),
+                     (".1234", 0.1234), (".12345", 0.12345), (".123456", 0.123456),
+                     (".1234567", 0.123456), (".12345678", 0.123456),
+                     (".123456789", 0.123456), (".999999999", 0.999999))
+        for suffix, offset in (("Z", 0), ("+00:00", 0), ("+05:30", 19800), ("-07:00", -25200)):
+            for fraction, seconds in fractions:
+                stamp = "2026-10-17T12:00:00" + fraction + suffix
+                expected = base + seconds - offset
+                for parse, scale in ((usage.epoch, 1), (codex.iso_time, 1), (agy.when_ms, 1000)):
+                    with self.subTest(stamp=stamp, parser=parse.__name__):
+                        self.assertEqual(parse(stamp), expected * scale)
+
+    def test_fractional_precision_and_offsets(self):
+        self.check_timestamps()
+
+    def test_python38_fromisoformat_compatibility(self):
+        def legacy_parse(value):
+            # Python 3.8-3.10 accept only 3/6 fractional digits and no trailing Z.
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+                                r"(?:\.\d{3}(?:\d{3})?)?[+-]\d{2}:\d{2}", value):
+                raise ValueError("unsupported ISO timestamp")
+            return datetime.fromisoformat(value)
+
+        with patch.object(usage, "datetime") as usage_datetime, patch.object(codex, "datetime") as codex_datetime:
+            usage_datetime.fromisoformat.side_effect = legacy_parse
+            codex_datetime.fromisoformat.side_effect = legacy_parse
+            self.check_timestamps()
+
+    def test_invalid_timestamps(self):
+        for value in (None, 123, [], "", "not a date", "2026-10-17T12:00:00.badZ"):
+            with self.subTest(value=value):
+                self.assertIsNone(usage.epoch(value))
+                self.assertEqual(codex.iso_time(value), 0.0)
 
 
 class TranscriptTests(Files):
@@ -217,7 +258,7 @@ class AttributionTests(Files):
 
     def test_relative_cd_equal_forms(self):
         for flag in ("--cd=rel", "-C=rel", '--cd="rel"', '--cd "rel"'):
-            self.assertEqual(self.call('codex exec ' + flag + ' task')["cwd"], str(self.root / "rel"))
+            self.assertEqual(self.call('codex exec ' + flag + ' task')["cwd"], codex.norm_path(str(self.root / "rel")))
 
     def test_multiline_and_unclosed_prompt(self):
         self.assertEqual(self.call('codex exec "first\nsecond exec line"')["prompt"], "first second exec line")
@@ -240,7 +281,7 @@ class AttributionTests(Files):
         (sub / "brief.txt").write_text("codex dir brief")
         (self.root / "brief.txt").write_text("shell dir brief")
         call = self.call('DIR=rel codex exec --cd="$DIR" - < brief.txt')
-        self.assertEqual(call["cwd"], str(sub))
+        self.assertEqual(call["cwd"], codex.norm_path(str(sub)))
         self.assertEqual(call["brief"], "shell dir brief")
 
     def test_unexpandable_cd_is_unknown_not_wrong(self):
@@ -264,7 +305,7 @@ class AttributionTests(Files):
 
     def test_file_uris_on_both_platforms(self):
         with patch.object(os, "name", "posix"):
-            self.assertEqual(agy.workspaces('["file:///home/me/a%20b", "https://example.com/x"]'), {"/home/me/a b"})
+            self.assertEqual(agy.workspaces('["file:///home/me/a%20b", "https://example.com/x"]'), {codex.norm_path("/home/me/a b")})
             self.assertEqual(agy.workspaces('["file:///C:/repo"]'), {"/C:/repo"})
         with patch.object(os, "name", "nt"):
             self.assertEqual(agy.workspaces('["file:///C:/repo", "file://server/share/a%20b"]'),
@@ -403,6 +444,149 @@ class UsageTests(Files):
                 self.assertEqual(runpy.run_path(usage.__file__)["AGY"], expected)
 
 
+class ReviewRegressionTests(Files):
+    def test_symlink_paths_match_on_both_sides(self):
+        alias = self.root / "alias"
+        actual = self.root / "actual"
+        actual.mkdir()
+        alias.symlink_to(actual, target_is_directory=True)
+        self.assertEqual(codex.norm_path(str(alias)), codex.norm_path(str(actual)))
+        self.assertEqual(codex.resolve_path("child", str(alias)), codex.norm_path(str(actual / "child")))
+        row = {"id": "run", "created_at_ms": 1000, "source": "exec", "cwd": str(actual),
+               "first_user_message": "task"}
+        self.assertEqual(set(codex.ours([row], [{"atMs": 1000, "cwd": str(alias), "prompt": "task"}])), {"run"})
+        with patch.object(os.path, "realpath", side_effect=OSError("unavailable")):
+            self.assertEqual(codex.norm_path("/tmp/../tmp/task"), "/tmp/task")
+            self.assertEqual(codex.resolve_path("task", "/tmp"), "/tmp/task")
+
+    def test_rollout_cache_and_invalidation(self):
+        path = self.root / "rollout.jsonl"
+        path.write_bytes(event("task_started", 100))
+        budget = [codex.SCAN_BYTES, time.monotonic() + 5]
+        first = codex.rollout_data(str(path), budget)
+        with patch.object(codex, "read_tail", side_effect=AssertionError("reread")):
+            self.assertEqual(codex.rollout_data(str(path), budget)[0], list(first[0]))
+        with path.open("ab") as f:
+            f.write(event("task_complete", 200))
+        self.assertEqual(codex.rollout_data(str(path), budget)[0][0], "task_complete")
+        os.utime(str(path), ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1))
+        with patch.object(codex, "read_tail", wraps=codex.read_tail) as read:
+            codex.rollout_data(str(path), budget)
+            read.assert_called_once()
+
+    def test_inventory_is_cached(self):
+        with patch.object(codex, "HOME", str(self.root)):
+            codex.quota_paths([], time.time())
+            with patch.object(os, "scandir", side_effect=AssertionError("rediscovered")):
+                self.assertEqual(codex.quota_paths([], time.time()), [])
+
+    def test_scan_reports_byte_and_time_budget_exhaustion(self):
+        path = self.root / "rollout.jsonl"
+        path.write_bytes(event("task_started", time.time()))
+        row = RolloutTests.thread(self, path, time.time())
+        for key, value in (("SCAN_BYTES", 1), ("SCAN_SECONDS", -1)):
+            with self.subTest(key=key), patch.object(codex, key, value), \
+                    patch.object(codex, "ours", return_value={"mine": {}}), \
+                    patch.object(codex, "session_calls", return_value=[]), \
+                    patch.object(codex, "quota_paths", return_value=[]):
+                result = codex.scan("budget", [row])
+                self.assertIn("incomplete", result["stale"])
+
+    def test_database_errors_keep_previous_agents_and_mark_boxes_stale(self):
+        (self.root / "state_1.sqlite").touch()
+        (self.root / "conversation_summaries.db").touch()
+        agent = {"id": "running", "task": "work", "parentId": None, "startedAtMs": 1}
+        for provider, module, fn, renderer in (("codex", codex, codex.threads, boxes.codex_box),
+                                                ("agy", agy, agy.conversations, boxes.agy_box)):
+            with self.subTest(provider=provider), patch.object(module, "HOME", str(self.root)):
+                old = {"nowMs": 1, "agents": [agent]}
+                if provider == "codex":
+                    old.update(limits=[], limitsAtMs=0, plan=None)
+                codex.finish_scan(provider, "session", old)
+                with patch.object(module.sqlite3, "connect", side_effect=sqlite3.OperationalError("database is locked")):
+                    rows = fn()
+                self.assertEqual(rows.stale, "database locked")
+                with patch.object(usage, "cached", return_value={}):
+                    box = renderer("session", rows=rows)
+                self.assertEqual(box["stale"], "database locked")
+                self.assertEqual(len(box["agents"]), 1)
+                with patch.object(codex, "quota_paths", return_value=[]), \
+                        patch("bench_scan.runs", return_value=[]):
+                    fresh = module.scan("session", rows=[])
+                self.assertEqual(fresh["agents"], [])
+                self.assertNotIn("stale", fresh)
+                self.assertEqual(module.scan("session", rows=rows)["agents"], [])
+
+    def test_agy_sql_cutoff_normalizes_offsets_and_limits_rows(self):
+        db = self.root / "conversation_summaries.db"
+        con = sqlite3.connect(str(db))
+        con.execute("create table conversation_summaries (conversation_id text, last_modified_time text)")
+        # Same instant across ISO separators, offsets and fractional precision.
+        from datetime import datetime, timezone, timedelta
+        now = time.time()
+        stamps = [datetime.fromtimestamp(now, timezone(timedelta(hours=h))).isoformat(sep=sep)
+                  for h, sep in ((0, " "), (9, "T"), (-7, "T"))]
+        con.executemany("insert into conversation_summaries values (?, ?)",
+                        [(str(i), stamps[i % 3]) for i in range(450)] + [("old", "2000-01-01T00:00:00Z")])
+        con.commit()
+        con.close()
+        with patch.object(agy, "HOME", str(self.root)):
+            rows = agy.conversations()
+        self.assertEqual(len(rows), 400)
+        self.assertNotIn("old", {r["conversation_id"] for r in rows})
+        self.assertTrue(all(abs(r["modifiedAtMs"] - now * 1000) < 1 for r in rows))
+
+    def test_malformed_usage_entries_preserve_valid_windows(self):
+        good = {"name": "Gemini Models", "buckets": [{"window": "5h", "remaining_fraction": 0.5}]}
+        data = {"groups": [good, None, [], 42, {"name": 42}, {"name": "Gemini Models", "buckets": [
+            None, [], {"window": [], "remaining_fraction": 0.1},
+            *[{"window": "5h", "remaining_fraction": x} for x in (float("nan"), float("inf"), -float("inf"), 10 ** 500)],
+            {"window": "weekly", "remaining_fraction": 0.75, "reset_time": []}]}]}
+        self.assertEqual(usage.parse(data), {"gemini": {"5h": {"used": 50}, "7d": {"used": 25}}})
+        self.assertEqual(usage.parse({"groups": {"bad": 1}}), {})
+
+    def test_multiple_launches_share_the_relays_via(self):
+        call = {"kind": "codex", "atMs": 1000, "prompt": "task", "via": "relay"}
+        launches = [{"kind": "codex", "startMs": at, "prompt": "task"} for at in (1500, 1600)]
+        self.assertEqual([c["via"] for c in codex.merge_launches([call], launches)], ["relay", "relay"])
+
+    def test_quoted_windows_trailing_backslash_does_not_swallow_launch(self):
+        with patch.object(os, "name", "nt"):
+            calls = codex.parsed_calls(1000, r'codex exec -C "C:\work\\" "task"; agy -p "next"')
+        self.assertEqual([c["kind"] for c in calls], ["codex", "agy"])
+        self.assertEqual(calls[0]["cwd"], "c:\\work")
+        self.assertEqual(calls[0]["prompt"], "task")
+
+    def test_backtick_escape_is_powershell_only(self):
+        command = 'codex exec "literal`"; agy -p "next"'
+        self.assertEqual(len(codex.parsed_calls(1000, command)), 2)
+        self.assertEqual(len(codex.parsed_calls(1000, command, powershell=True)), 1)
+        raw = record(command=command).replace(b'"Bash"', b'"PowerShell"')
+        data = {"calls": []}
+        codex.extract_calls(raw, data, 0)
+        self.assertEqual(len(data["calls"]), 1)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires FIFOs")
+    def test_fifo_rollouts_are_never_opened(self):
+        path = str(self.root / "fifo")
+        os.mkfifo(path)
+        with patch("builtins.open", side_effect=AssertionError("opened FIFO")):
+            with self.assertRaises(OSError):
+                codex.read_tail(path)
+            self.assertEqual(codex.last_action(path), None)
+            self.assertEqual(codex.thread_identity({"rollout_path": path}, [100]), (None, None))
+
+    @unittest.skipIf(os.name == "nt", "POSIX permissions")
+    def test_brief_caches_are_private_even_with_open_umask(self):
+        old = os.umask(0)
+        try:
+            path = str(self.state / "private.json")
+            codex.save_transcript(path, {"brief": "private text"})
+        finally:
+            os.umask(old)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+
 class WindowTests(unittest.TestCase):
     def test_raw_window_for_the_router(self):
         now = 1_000_000_000
@@ -491,6 +675,48 @@ class BenchTests(Files):
         self.run_log("claude", [use("Bash", {"command": "ls"}), {"type": "user"}, use("Read", {"file_path": "/x/a.png"})])
         [row] = self.rows("claude", calls)
         self.assertEqual((row["count"], row["now"]), ("2 tools", "Read a.png"))
+
+    def test_tool_counts_resume_offsets_and_restart_after_truncation_or_replacement(self):
+        path = self.root / "agent_log.jsonl"
+        line = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use"}]}}).encode() + b"\n"
+        path.write_bytes(line * 2)
+        self.assertEqual(self.bench.tool_calls(str(path)), 2)
+        cache = codex.state_path("bench", str(path))
+        self.assertEqual(codex.read_state(cache)["offset"], len(line) * 2)
+        with patch.object(self.bench.json, "loads", wraps=json.loads) as loads:
+            self.assertEqual(self.bench.tool_calls(str(path)), 2)
+            self.assertFalse(any(isinstance(c.args[0], bytes) for c in loads.call_args_list))
+        with path.open("ab") as f:
+            f.write(line)
+        with patch.object(self.bench.json, "loads", wraps=json.loads) as loads:
+            self.assertEqual(self.bench.tool_calls(str(path)), 3)
+            self.assertEqual([c.args[0] for c in loads.call_args_list if isinstance(c.args[0], bytes)], [line])
+        path.write_bytes(line)
+        self.assertEqual(self.bench.tool_calls(str(path)), 1)
+        replacement = self.root / "newlog"
+        replacement.write_bytes(line * 2)
+        os.replace(str(replacement), str(path))
+        self.assertEqual(self.bench.tool_calls(str(path)), 2)
+
+    def test_tool_counts_retry_partial_records_and_checkpoint_budget(self):
+        path = self.root / "agent_log.jsonl"
+        line = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use"}]}}).encode() + b"\n"
+        path.write_bytes(line + line[:20])
+        self.assertEqual(self.bench.tool_calls(str(path)), 1)
+        with path.open("ab") as f:
+            f.write(line[20:] + line)
+        with patch.object(self.bench, "TAIL", len(line)):
+            self.assertEqual(self.bench.tool_calls(str(path)), 2)
+            self.assertEqual(self.bench.tool_calls(str(path)), 3)
+
+    def test_tool_count_makes_progress_past_an_image_sized_record(self):
+        path = self.root / "agent_log.jsonl"
+        line = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use"}, {"type": "image", "data": "x" * 1000}]}}).encode() + b"\n"
+        path.write_bytes(line * 2)
+        with patch.object(self.bench, "TAIL", 100):
+            self.assertEqual(self.bench.tool_calls(str(path)), 1)
+            self.assertEqual(self.bench.tool_calls(str(path)), 2)
 
     def test_finished_runs_drop_out(self):
         calls = self.launch()

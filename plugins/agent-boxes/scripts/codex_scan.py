@@ -46,10 +46,50 @@ STATE = os.path.join(CLAUDE_HOME, "agent-boxes")
 _TRANSCRIPTS = {}
 _COMMANDS = {}
 _READ_BUDGET = None
-CACHE_VERSION = 7
+CACHE_VERSION = 8
 TRANSCRIPT_BYTES = 64 * 1024 * 1024
 TRANSCRIPT_SECONDS = 2
 RECORD_BYTES = 4 * 1024 * 1024
+SCAN_BYTES = 16 * 1024 * 1024
+SCAN_SECONDS = 2
+INVENTORY_SECONDS = 60
+
+
+class ScanRows(list):
+    """An unavailable database is different from a successful empty query."""
+    def __init__(self, rows=(), stale=None):
+        super().__init__(rows)
+        self.stale = stale
+
+
+class Incomplete(Exception):
+    pass
+
+
+def check_budget(budget):
+    if budget[0] <= 0 or (len(budget) > 1 and time.monotonic() >= budget[1]):
+        raise Incomplete("scan budget exceeded")
+
+
+def state_path(kind, key):
+    return os.path.join(STATE, kind + "-" + hashlib.sha256(os.fsencode(key)).hexdigest()[:32] + ".json")
+
+
+def read_state(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return obj(json.load(f))
+    except (OSError, ValueError):
+        return {}
+
+
+def finish_scan(provider, session_id, out, stale=None):
+    path = state_path("snapshot-" + provider, session_id or "")
+    if stale:
+        old = read_state(path)
+        return {**out, **old, "nowMs": out["nowMs"], "stale": stale}
+    save_transcript(path, out)
+    return out
 
 # Flags with values, including global options accepted before `exec`.
 VAR = re.compile(r"""\$\{?([A-Za-z_]\w*)\}?""")
@@ -67,7 +107,7 @@ def iso_time(value):
     """ISO time with microseconds, including on Python 3.8."""
     if not isinstance(value, str):
         return 0.0
-    value = re.sub(r"(\.\d{6})\d+", r"\1", value)
+    value = re.sub(r"\.([0-9]+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"), value)
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
     except ValueError:
@@ -76,6 +116,8 @@ def iso_time(value):
 
 def tail_events(path, size):
     """Yields the parsed JSON lines of the file's last `size` bytes, newest first."""
+    if not os.path.isfile(path):
+        return
     with open(path, "rb") as f:
         f.seek(0, 2)
         end = f.tell()
@@ -106,14 +148,18 @@ def read_tail(path, budget=None):
     The last event's own timestamp stands for activity: Windows does not move
     a file's mtime while the writer keeps it open.
     """
+    if not os.path.isfile(path):
+        raise OSError("rollout is not a regular file")
     life = info = limits = None
     last_at = limits_at = 0.0
     size = os.path.getsize(path)
-    left = min(size, TAILS[-1], budget[0] if budget is not None else size)
+    left = min(size, TAILS[-1])
     end, carry = size, b""
     with open(path, "rb") as f:
         while left:
-            n = min(TAILS[0], left)
+            if budget is not None:
+                check_budget(budget)
+            n = min(TAILS[0], left, budget[0] if budget is not None else left)
             end -= n
             f.seek(end)
             lines = (f.read(n) + carry).split(b"\n")
@@ -228,8 +274,8 @@ def threads(lookback_ms=LOOKBACK_MS):
         )
         cols = [c[0] for c in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
-    except sqlite3.Error:
-        return []
+    except sqlite3.Error as e:
+        return ScanRows(stale="database locked" if "locked" in str(e).lower() else "database unavailable")
     finally:
         if con is not None:
             con.close()
@@ -246,6 +292,10 @@ def norm_path(p):
     if p and p.startswith("\\\\?\\"):  # Windows long-path prefix \\?\
         p = p[4:]
     paths = ntpath if os.name == "nt" else posixpath
+    try:
+        p = os.path.realpath(p) if p and paths is os.path and paths.isabs(p) else p
+    except (OSError, ValueError):
+        pass
     return paths.normcase(paths.normpath(p)) if p and paths.isabs(p) else None
 
 
@@ -306,7 +356,8 @@ def extract_calls(raw, data, since_ms):
         command = inp.get("command")
         if (block.get("type") == "tool_use" and block.get("name") in SHELL_TOOLS
                 and isinstance(command, str) and any(k in command for k in ("codex", "agy", "bench.py"))):
-            calls = parsed_calls(at_ms, command, inp.get("cwd") or ev.get("cwd"))
+            calls = parsed_calls(at_ms, command, inp.get("cwd") or ev.get("cwd"),
+                                 powershell=block.get("name") == "PowerShell")
             data["calls"].extend(calls)
             kind = None if calls else looks_like_launch(command)
             if kind:
@@ -317,7 +368,8 @@ def save_transcript(cache, data):
     tmp = cache + ".%s.tmp" % os.getpid()
     try:
         os.makedirs(STATE, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+            os.chmod(tmp, 0o600)
             json.dump(data, f)
         os.replace(tmp, cache)
     except OSError:
@@ -335,7 +387,8 @@ def prune_transcripts():
     except OSError:
         return
     for name in names:
-        if name.endswith(".tmp") or name.startswith(("transcript-", "launches-")) and name.endswith(".json"):
+        if name.endswith(".tmp") or name.startswith(("transcript-", "launches-", "rollout-", "identity-",
+                                                     "inventory-", "snapshot-", "bench-")) and name.endswith(".json"):
             path = os.path.join(STATE, name)
             try:
                 expiry = time.time() - 3600 if name.endswith(".tmp") else cutoff
@@ -577,17 +630,7 @@ def remembered(session_id, live, since):
                      "ids": [list(i) for i in sorted(ids | {tuple(i) for i in same["ids"]})]})
     keep = [{k: v for k, v in c.items() if k != "alive"} for c in merged]
     if keep != old:
-        tmp = path + ".%s.tmp" % os.getpid()
-        try:
-            os.makedirs(STATE, exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"version": 2, "calls": keep}, f)
-            os.replace(tmp, path)
-        except OSError:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+        save_transcript(path, {"version": 2, "calls": keep})
     return merged
 
 
@@ -646,7 +689,7 @@ def merge_launches(calls, launches, unparsed=()):
             if free:
                 pair[k] = max(free, key=lambda i: calls[i]["atMs"])
                 used.add(pair[k])
-            vias[k] = agreed.pop() if len(agreed) == 1 else None
+            vias[k] = next(iter(agreed)) if len(agreed) == 1 else None
     used = set(pair.values())
     out = []
     for k, p in enumerate(launches):
@@ -680,7 +723,7 @@ def expand(text, env):
     return VAR.sub(lambda m: env.get(m.group(1), m.group(0)), text)
 
 
-def shell_segments(command):
+def shell_segments(command, powershell=False):
     """Words and boundaries, keeping quoted newlines and heredoc bodies intact."""
     segments, words, word = [], [], []
     quote, started, i = None, False, 0
@@ -697,11 +740,11 @@ def shell_segments(command):
 
     while i < len(command):
         ch = command[i]
-        if ch in ("\\", "`") and quote != "'" and i + 1 < len(command):
+        if (ch == "\\" or ch == "`" and powershell) and quote != "'" and i + 1 < len(command):
             if command.startswith("\n", i + 1) or command.startswith("\r\n", i + 1):
                 i += 2 if command.startswith("\n", i + 1) else 3
                 continue
-            if command[i + 1] in (quote, '"', "'", " ", "\t", ";", "|", "&"):
+            if command[i + 1] in ("\\", quote, '"', "'", " ", "\t", ";", "|", "&"):
                 word.append(command[i + 1])
                 started = True
                 i += 2
@@ -781,8 +824,8 @@ def resolve_path(path, cwd=None):
     if re.search(r"[$`]", path) or path.startswith("~"):
         return None
     if paths.isabs(path):
-        return paths.normpath(path)
-    return paths.normpath(paths.join(cwd, path)) if cwd else None
+        return norm_path(path)
+    return norm_path(paths.join(cwd, path)) if cwd else None
 
 
 def brief_text(path, cwd=None):
@@ -849,10 +892,10 @@ def looks_like_launch(command, depth=0):
     return None
 
 
-def parsed_calls(at_ms, command, cwd=None):
+def parsed_calls(at_ms, command, cwd=None, powershell=False):
     """Persist only matching fields; never keep the original shell command."""
     out, env, previous = [], {}, []
-    for seg in shell_segments(command):
+    for seg in shell_segments(command, powershell=powershell):
         words = list(seg["words"])
         while words and re.match(r"^[A-Za-z_]\w*=", words[0]):
             key, value = words.pop(0).split("=", 1)
@@ -949,10 +992,23 @@ def exec_calls(at_ms, command, cwd=None):
 def thread_identity(thread, budget):
     """Fill missing cwd/first prompt from a bounded rollout header."""
     cwd, prompt = thread.get("cwd"), thread.get("first_user_message")
-    if cwd and prompt or budget[0] <= 0:
+    if cwd and prompt:
         return cwd, prompt
     try:
-        with open(thread["rollout_path"], "rb") as f:
+        check_budget(budget)
+        path = thread["rollout_path"]
+        if not os.path.isfile(path):
+            return cwd, prompt
+        stat = os.stat(path)
+        signature = [path, stat.st_mtime_ns, stat.st_size]
+        cache = state_path("identity", path)
+        data = read_state(cache)
+        if data.get("signature") == signature:
+            return cwd or data.get("cwd"), prompt or data.get("prompt")
+        allowance = min(HEAD_BYTES, stat.st_size)
+        if budget[0] < allowance:
+            raise Incomplete("scan budget exceeded")
+        with open(path, "rb") as f:
             raw = f.read(min(HEAD_BYTES, budget[0]))
         budget[0] -= len(raw)
     except (OSError, TypeError, KeyError):
@@ -971,6 +1027,7 @@ def thread_identity(thread, budget):
             prompt = prompt or " ".join(str(obj(c).get("text") or "") for c in p["content"])
         if cwd and prompt:
             break
+    save_transcript(cache, {"signature": signature, "cwd": cwd, "prompt": norm_text(prompt)})
     return cwd, prompt
 
 
@@ -1027,17 +1084,19 @@ def pair_calls(roots, calls, id_key, time_key, compatible, matches, after):
     return claimed
 
 
-def ours(rows, calls):
+def ours(rows, calls, budget=None):
     """Thread id -> the call that started it, for the session's calls and their descendants."""
     roots = [t for t in rows if parent_of(t["source"]) is None and t["created_at_ms"]]
-    identities, budget = {}, [QUOTA_BYTES]
+    identities, budget = {}, budget if budget is not None else [QUOTA_BYTES]
 
     def compatible(a, b):
+        check_budget(budget)
         ac, bc = norm_path(a.get("cwd")), norm_path(b.get("cwd"))
         ap, bp = prompts(a), prompts(b)
         return (not ac or not bc or ac == bc) and (not ap or not bp or any(same_prompt(x, y) for x in ap for y in bp))
 
     def matches(c, t):
+        check_budget(budget)
         cwd, wanted = norm_path(c.get("cwd")), prompts(c)
         if c.get("cwd") and cwd is None:
             return False
@@ -1060,28 +1119,78 @@ def ours(rows, calls):
     return claimed
 
 
-def quota_paths(rows, now):
+def quota_paths(rows, now, budget=None):
     """Newest rollouts from the database, then recent on-disk sessions."""
+    if budget is not None:
+        check_budget(budget)
     paths = {t["rollout_path"]: (t["updated_at_ms"] or 0) / 1000 for t in rows if t.get("rollout_path")}
-    for days in range(8):
-        day = datetime.fromtimestamp(now) - timedelta(days=days)
-        pattern = os.path.join(HOME, "sessions", day.strftime("%Y/%m/%d"), "*.jsonl")
-        for path in glob.glob(pattern):
+    cache = state_path("inventory", HOME)
+    data = read_state(cache)
+    if not 0 <= now - data.get("at", 0) < INVENTORY_SECONDS:
+        found = {}
+        for days in range(8):
+            if budget is not None:
+                check_budget(budget)
+            day = datetime.fromtimestamp(now) - timedelta(days=days)
+            directory = os.path.join(HOME, "sessions", day.strftime("%Y/%m/%d"))
             try:
-                paths[path] = max(paths.get(path, 0), os.path.getmtime(path))
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        if budget is not None:
+                            check_budget(budget)
+                        if entry.name.endswith(".jsonl") and entry.is_file():
+                            found[entry.path] = entry.stat().st_mtime
+                        if len(found) > QUOTA_FILES * 2:
+                            found = dict(sorted(found.items(), key=lambda x: x[1], reverse=True)[:QUOTA_FILES])
             except OSError:
-                pass
+                continue
+        data = {"at": now, "paths": sorted(found, key=found.get, reverse=True)[:QUOTA_FILES]}
+        save_transcript(cache, data)
+    for path in data.get("paths", []):
+        try:
+            paths[path] = max(paths.get(path, 0), os.path.getmtime(path))
+        except OSError:
+            pass
     return [p for p in sorted(paths, key=paths.get, reverse=True)
             if paths[p] * 1000 >= now * 1000 - QUOTA_LOOKBACK_MS][:QUOTA_FILES]
+
+
+def rollout_data(path, budget):
+    """Cache bounded tail summaries, never rollout contents, by file identity."""
+    check_budget(budget)
+    if not os.path.isfile(path):
+        raise OSError("rollout is not a regular file")
+    stat = os.stat(path)
+    signature = [path, stat.st_mtime_ns, stat.st_size, stat.st_ino]
+    cache = state_path("rollout", path)
+    data = read_state(cache)
+    if data.get("signature") == signature and isinstance(data.get("tail"), list):
+        return data["tail"], data.get("action")
+    tail = read_tail(path, budget)
+    check_budget(budget)
+    allowance = min(stat.st_size, ACTION_TAIL)
+    if allowance > budget[0]:
+        raise Incomplete("scan budget exceeded")
+    budget[0] -= allowance
+    action = last_action(path)
+    save_transcript(cache, {"signature": signature, "tail": tail, "action": action})
+    return tail, action
 
 
 def scan(session_id, rows=None):
     now = time.time()
     rows = threads(QUOTA_LOOKBACK_MS) if rows is None else rows
+    empty = {"nowMs": int(now * 1000), "agents": [], "limits": [], "limitsAtMs": 0, "plan": None}
+    if getattr(rows, "stale", None):
+        return finish_scan("codex", session_id, empty, rows.stale)
+    budget = [SCAN_BYTES, time.monotonic() + SCAN_SECONDS]
     recent_rows = [t for t in rows if (t["updated_at_ms"] or 0) > now * 1000 - LOOKBACK_MS]
-    mine = ours(recent_rows, session_calls(session_id)) if recent_rows else {}
+    try:
+        mine = ours(recent_rows, session_calls(session_id), budget) if recent_rows else {}
+    except Incomplete:
+        return finish_scan("codex", session_id, empty, "incomplete: scan budget exceeded")
     agents, limits, limits_at = [], None, 0
-    tails = {}
+    tails, incomplete = {}, None
     for t in recent_rows:
         if t["id"] not in mine:
             continue
@@ -1092,8 +1201,11 @@ def scan(session_id, rows=None):
             continue
         updated = max(mtime, (t["updated_at_ms"] or 0) / 1000)
         try:
-            life, info, rl, last_at, rl_at = read_tail(path, [2 * 1024 * 1024])
+            (life, info, rl, last_at, rl_at), action = rollout_data(path, budget)
             tails[path] = (life, info, rl, last_at, rl_at)
+        except Incomplete:
+            incomplete = "incomplete: scan budget exceeded"
+            break
         except OSError:
             continue
         active_at = max(updated, last_at)
@@ -1119,24 +1231,25 @@ def scan(session_id, rows=None):
             "ctxPercent": ctx,
             "startedAtMs": t["created_at_ms"] or 0,
             "updatedAtMs": int(active_at * 1000),
-            "now": last_action(path),
+            "now": action,
             "via": mine[t["id"]].get("via"),
         })
-    budget = QUOTA_BYTES
-    for path in quota_paths(rows, now):
-        if budget <= 0:
-            break
+    try:
+        paths = quota_paths(rows, now, budget)
+    except Incomplete:
+        paths, incomplete = [], "incomplete: scan budget exceeded"
+    for path in paths:
         try:
             if path in tails:
                 _, _, rl, last_at, rl_at = tails[path]
             else:
-                allowance = [min(QUOTA_BYTES // QUOTA_FILES, budget)]
-                before = allowance[0]
-                _, _, rl, last_at, rl_at = read_tail(path, allowance)
-                budget -= before - allowance[0]
+                (_, _, rl, last_at, rl_at), _ = rollout_data(path, budget)
             at = rl_at or last_at or os.path.getmtime(path)
             if rl and at > limits_at:
                 limits, limits_at = rl, at
+        except Incomplete:
+            incomplete = "incomplete: scan budget exceeded"
+            break
         except OSError:
             continue
     windows = []
@@ -1157,7 +1270,9 @@ def scan(session_id, rows=None):
         "limitsAtMs": int(limits_at * 1000),
         "plan": (limits or {}).get("plan_type"),
     }
-    return out
+    if time.monotonic() >= budget[1]:
+        incomplete = "incomplete: scan budget exceeded"
+    return finish_scan("codex", session_id, out, incomplete)
 
 
 def main():

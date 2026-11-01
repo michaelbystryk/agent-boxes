@@ -8,7 +8,9 @@ most every MIN_S), and otherwise only every REFRESH_S. A window that resets in
 between shows as reset from its cached resetsAt.
 """
 import json
+import math
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -128,24 +130,33 @@ def cached(activity_ms=0):
 
 def epoch(stamp):
     try:
+        # Python 3.8-3.10 accept only 3 or 6 fractional digits; convert Z below too.
+        stamp = re.sub(r"\.([0-9]+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"), stamp)
         return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
-    except (AttributeError, ValueError):
+    except (AttributeError, ValueError, TypeError, OverflowError, OSError):
         return None
 
 
 def parse(usage):
     """agy's `/usage` command data -> {'gemini': {'5h': {'used': 19.5, 'resetsAt': ...}, '7d': {...}}, 'claude/gpt': {...}}"""
     groups = {}
-    for g in (usage or {}).get("groups") or []:
+    source = usage.get("groups") if isinstance(usage, dict) else None
+    for g in source if isinstance(source, list) else []:
+        if not isinstance(g, dict) or not isinstance(g.get("name"), str):
+            continue
         name = (g.get("name") or "").lower()
         if name.endswith(" models"):
             name = name[: -len(" models")]
         name = name.replace(" and ", "/")
         windows = {}
-        for b in g.get("buckets") or []:
+        buckets = g.get("buckets")
+        for b in buckets if isinstance(buckets, list) else []:
+            if not isinstance(b, dict) or not isinstance(b.get("window"), str):
+                continue
             key = {"weekly": "7d", "5h": "5h"}.get(b.get("window"))
             left = b.get("remaining_fraction")
-            if key is None or isinstance(left, bool) or not isinstance(left, (int, float)):
+            if (key is None or isinstance(left, bool) or not isinstance(left, (int, float))
+                    or not 0 <= left <= 1 or not math.isfinite(left)):
                 continue
             w = windows[key] = {"used": round(100 * (1 - left), 2)}
             # An untouched window's reset_time just rolls forward, so keep it only once quota is used.
@@ -153,7 +164,7 @@ def parse(usage):
             if resets is not None:
                 w["resetsAt"] = resets
         if name and windows:
-            groups[name] = windows
+            groups.setdefault(name, {}).update(windows)
     return groups
 
 
