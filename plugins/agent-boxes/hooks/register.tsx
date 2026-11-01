@@ -133,6 +133,13 @@ let tools: { codex: boolean; agy: boolean; atMs: number } | undefined
 let lastGood: Scan | null = null
 let failures = 0
 let skipScans = 0
+// Background errors already written to the transcript; each is written once, so a quiet chat stays quiet.
+const loggedOnce = new Set<string>()
+const logOnce = ($: EngineInterface, text: string) => {
+  if (loggedOnce.has(text)) return
+  loggedOnce.add(text)
+  $.ui.log(text)
+}
 // Claude's own folder (CLAUDE_CONFIG_DIR, else ~/.claude) and the home folder.
 let claudeDir: string | undefined
 let homeDir: string | undefined
@@ -329,7 +336,7 @@ async function measure($: EngineInterface, rateLimits?: SessionRateLimit[]) {
     }
     await update($, claude, old => (JSON.stringify(old) === JSON.stringify(next) ? old : next))
   } catch (err) {
-    $.ui.log(`agent-boxes: ${String(err)}`)
+    logOnce($, `agent-boxes: ${String(err)}`)
   }
 }
 
@@ -430,10 +437,10 @@ const noPython = (has: { codex: boolean; agy: boolean }): Scan => {
 }
 
 // A scan that was slow or failed with Python known: the last good boxes with a hint, and a back-off.
+// The hint shows on the boxes in the pane, not in the transcript.
 async function trouble($: EngineInterface, hint: string): Promise<Scan> {
   failures++
   skipScans = Math.min(6, 2 ** (failures - 1))
-  $.ui.log(`agent-boxes: ${hint}`)
   let base = lastGood
   if (!base) {
     const has = await installed($)
@@ -460,7 +467,7 @@ async function scanNow($: EngineInterface): Promise<Scan | undefined> {
   // The first loss rediscovers at once; another within RETRY_MS (an interpreter that passes the
   // version check but cannot run the scan) waits out the back-off instead of looping.
   const lost = async (why: string) => {
-    $.ui.log(`agent-boxes: ${cmd.join(' ')} would not start (${why}); looking for Python again`)
+    logOnce($, `agent-boxes: ${cmd.join(' ')} would not start; looking for Python again`)
     const now = await $.clock.now()
     const isRepeat = lostAtMs !== undefined && now - lostAtMs < RETRY_MS
     lostAtMs = now
@@ -516,7 +523,7 @@ async function pollOnce($: EngineInterface) {
     if (next) await update($, scan, old => (JSON.stringify(old) === JSON.stringify(next) ? old : next))
     if (next) await refreshRouter($, lastGood ?? undefined)
   } catch (err) {
-    $.ui.log(`agent-boxes: ${String(err)}`)
+    logOnce($, `agent-boxes: ${String(err)}`)
   }
 }
 
