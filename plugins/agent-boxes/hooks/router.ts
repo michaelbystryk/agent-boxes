@@ -21,6 +21,8 @@ import {
   categoryById,
   classify,
   contextNote,
+  delegateHint,
+  ownWords,
   firstJson,
   isContinuation,
   poolState,
@@ -395,9 +397,11 @@ export async function routeNote($: EngineInterface, e: PromptSubmitInput): Promi
     const now = await $.clock.now()
     // "ok, and the tests", "now push it": within the follow-up window, the same task.
     evictSpawns(now)
-    const mentioned = namedIn(e.text, executors())
-    const follows = last !== undefined && now - last.atMs < FOLLOW_MS && isContinuation(e.text)
-    const category = follows ? undefined : await categorize($, e.text)
+    // Tools named inside a pasted transcript or log are not the user asking for them.
+    const own = ownWords(e.text)
+    const mentioned = namedIn(own, executors())
+    const follows = last !== undefined && now - last.atMs < FOLLOW_MS && isContinuation(own)
+    const category = follows ? undefined : await categorize($, own.trim() ? own : e.text)
     named = new Set(mentioned.map(x => x.id))
     // This reply is the best signal of how the last prompt's work went: a new task grades it
     // either way, a continuation only when it says something about the result.
@@ -406,6 +410,10 @@ export async function routeNote($: EngineInterface, e: PromptSubmitInput): Promi
     // A reply that only names an executor ("use architect", "ok, on Opus") continues the task, and
     // still gets the note: the user's pick wins.
     if (!category && mentioned.length) note = namedNote(mentioned)
+    // A continuation keeps the task's placement: repeat where hand-offs go when that is off Claude.
+    else if (!category && last?.route.pick && last.route.pick.pool !== 'claude' && !last.route.isClaudeLow) {
+      note = !last.place.inLoop ? contextNote(last.route, await quota($, now), now, last.place) : delegateHint(last.route.pick, last.route.fallback)
+    }
     if (!category && prompt) {
       prompt.isOpen = true
       prompt.turnAtMs = now

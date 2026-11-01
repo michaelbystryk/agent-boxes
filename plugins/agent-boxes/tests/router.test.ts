@@ -20,6 +20,7 @@ import {
   roster,
   route,
   sizeOf,
+  ownWords,
 } from '../hooks/route'
 import type { Loop, Quota, Size } from '../hooks/route'
 import { bookQuota, isRateLimited, markLimited, newBook, takeScan } from '../hooks/router'
@@ -473,8 +474,9 @@ const SHADER_ASK = 'write a HLSL shader for the water edge glow'
 test('a reply within the follow-up window that starts with ok/now/and continues the task, keywords or not', async ($, on) => {
   const w = await boot($, on)
   expect(await w.say(BUG)).toMatch(/^\[router\] → agent-boxes:agy-argon/)
-  expect(await w.say('ok, and fix the error in the tests too')).toBe('')
-  expect(await w.say('now refactor the uploader across the repo')).toBe('')
+  // a continuation keeps the task's placement, so the off-Claude pick is repeated, not re-routed
+  expect(await w.say('ok, and fix the error in the tests too')).toMatch(/^\[router\] → agent-boxes:agy-argon/)
+  expect(await w.say('now refactor the uploader across the repo')).toMatch(/^\[router\] → agent-boxes:agy-argon/)
   expect(w.history().filter(x => x.event === 'route')).toHaveLength(1)
   // after the window, the same words route anew
   await w.clock.advance(16 * 60e3)
@@ -574,4 +576,20 @@ test('the best-placed line drops readings that expire while scans keep failing',
   failing.is = true
   await w.clock.advance(20 * 60e3)
   expect(await lead()).toMatchObject({ text: expect.stringMatching(/^Claude best placed · 70% free/) })
+})
+
+test('a short plan-step prompt is not small, and in-loop work still says where hand-offs go', async ($, on) => {
+  const w = await boot($, on)
+  expect(sizeOf('continue step 1')).toBe('medium')
+  expect(sizeOf('do phase 2')).toBe('medium')
+  expect(sizeOf('rename it')).toBe('small')
+  const note = await w.say('fix the uploader bug')
+  expect(note).toMatch(/^\[router\] (→|Do it here; if you hand any of it off →) agent-boxes:/)
+})
+
+test('tools named inside pasted text are not the user naming them', async ($, on) => {
+  const w = await boot($, on)
+  const pasted = 'why is this happening <pasted_content id="x1">Stop them and rerun on agy (Gemini 4 Argon, falling back to Codex)</pasted_content id="x1"> fix the uploader bug'
+  expect(await w.say(pasted)).not.toMatch(/You named/)
+  expect(ownWords(pasted)).not.toMatch(/Argon/)
 })

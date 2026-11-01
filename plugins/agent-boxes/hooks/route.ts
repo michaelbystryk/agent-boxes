@@ -80,7 +80,9 @@ const ACTIVITIES = ['review', 'bugfix', 'refactor', 'terminal', 'design', 'resea
 export function sizeOf(text: string): Size {
   const words = text.trim().split(/\s+/).filter(Boolean).length
   if (words > 80 || /\b(entire|whole|from scratch|every (file|tower|scene)|end to end)\b/i.test(text)) return 'large'
-  // Short prompts often ask for big work, so only a few words count as small.
+  // Short prompts often ask for big work ("continue step 1", "do phase 2"), so only a few words
+  // that point at no plan or step count as small.
+  if (/\b(continue|resume|proceed|carry on|keep going|next step|(step|phase|stage|part|task) \d+)\b/i.test(text)) return 'medium'
   return words < 6 ? 'small' : 'medium'
 }
 
@@ -341,7 +343,10 @@ export function contextNote(r: Route, quota: Quota, now: number, place?: Placeme
     return `[router] Every pool is near its limit (${quotaLine(quota, now)}). Don't delegate: keep the work small and tell the user.`
   }
   if (place?.inLoop) {
-    return r.isClaudeLow ? '[router] Claude is near its limit: keep your own turns short.' : undefined
+    if (r.isClaudeLow) return '[router] Claude is near its limit: keep your own turns short.'
+    // Done here, but if any of it gets handed off it should still go where the router placed it,
+    // not to whichever tool a saved note or habit prefers.
+    return r.pick.pool !== 'claude' ? delegateHint(r.pick, r.fallback) : undefined
   }
   const fallback = r.fallback ? ` (fallback ${short(r.fallback)})` : ''
   const fit = r.why.startsWith('best fit') ? 'best fit' : r.why
@@ -350,6 +355,14 @@ export function contextNote(r: Route, quota: Quota, now: number, place?: Placeme
   const q = r.isQuotaPick || r.isClaudeLow ? ` [${quotaLine(quota, now)}]` : ''
   return `[router] → ${short(r.pick)}${fallback}: ${r.category.id}; ${why}${low}${q}`
 }
+
+/** For work done in this chat: where any part handed off should go. */
+export const delegateHint = (pick: Executor, fallback?: Executor) =>
+  `[router] Do it here; if you hand any of it off → ${short(pick)}${fallback ? ` (fallback ${short(fallback)})` : ''}.`
+
+/** The user's own words: pasted blocks (a transcript, a log) name tools without asking for them. */
+export const ownWords = (text: string) =>
+  text.replace(/<pasted_content\b[^>]*>[\s\S]*?<\/pasted_content\b[^>]*>/gi, ' ').replace(/\[Pasted text[^\]]*\]/gi, ' ')
 
 /** The first balanced JSON object in a model's reply (prose or a second object may follow), or undefined. */
 export function firstJson(text: string): Record<string, unknown> | undefined {
