@@ -16,6 +16,10 @@ import {
 } from './router'
 
 const POLL_MS = 5000
+const HIDDEN_POLL_MS = 60000
+const PICK_AGE_MS = 10 * 60000
+const LOG_TTL_MS = 30 * 60000
+const LOG_MAX = 128
 const PANE = 'agent-boxes'
 // Tried in order when the `python` option is empty; `py` is the Windows launcher.
 const PYTHONS = [['python3'], ['python'], ['py']]
@@ -57,14 +61,15 @@ function readConfig(options: PluginOptions): Config {
 
 let options: PluginOptions = {}
 
-async function loadConfig($: EngineInterface) {
-  await folders($)
+async function loadConfig($: EngineInterface, gen: number) {
+  await folders($, gen)
+  if (gen !== loadGen) return
   const path = `${claudeDir}/agent-boxes/config.json`
   try {
     const file: unknown = (await $.fs.exists(path)) ? JSON.parse(await $.fs.read(path)) : {}
-    config = readConfig({ ...options, ...(file && typeof file === 'object' ? (file as PluginOptions) : {}) })
+    if (gen === loadGen) config = readConfig({ ...options, ...(file && typeof file === 'object' ? (file as PluginOptions) : {}) })
   } catch {
-    config = readConfig(options)  // an unreadable or broken file keeps the defaults
+    if (gen === loadGen) config = readConfig(options)  // an unreadable or broken file keeps the defaults
   }
 }
 
@@ -114,6 +119,7 @@ let isScanning = false
 let isPollQueued = false
 // Whether the latest poll found the pane placed and scanned.
 let scannedPlaced = false
+let hiddenPolledAtMs: number | undefined
 let isBriefing = false
 // A summary asked for while one ran, and the turn it is for.
 let queuedGen: number | undefined
@@ -133,12 +139,24 @@ let tools: { codex: boolean; agy: boolean; atMs: number } | undefined
 let lastGood: Scan | null = null
 let failures = 0
 let skipScans = 0
-// Background errors already written to the transcript; each is written once, so a quiet chat stays quiet.
-const loggedOnce = new Set<string>()
-const logOnce = ($: EngineInterface, text: string) => {
-  if (loggedOnce.has(text)) return
-  loggedOnce.add(text)
-  $.ui.log(text)
+// Collapse changing paths, ids and counters; retain only a bounded set of recent categories.
+const loggedOnce = new Map<string, number>()
+const errorCategory = (text: string) => text.toLowerCase()
+  .replace(/["'][^"'\n]*[\\/][^"'\n]*["']/g, '<path>')
+  .replace(/(?:[a-z]:)?[\\/][^\s,;:)]+/g, '<path>')
+  .replace(/\b((?:sub)?agent|request)(?:[ _-]?id)?(?:\s*[:=]\s*|\s+)["']?[\w-]+["']?/g, '$1 <id>')
+  .replace(/\b(?:0x[\da-f]+|[\da-f]{8,}|[\da-f]{8}(?:-[\da-f]+)+)\b/g, '<hex>')
+  .replace(/\b[\w-]*\d[\w-]*\b/g, '<number>')
+const logOnce = async ($: EngineInterface, text: string, gen: number) => {
+  if (gen !== loadGen) return
+  const now = await $.clock.now()
+  if (gen !== loadGen) return
+  for (const [key, at] of loggedOnce) if (now - at >= LOG_TTL_MS) loggedOnce.delete(key)
+  const key = errorCategory(text)
+  if (loggedOnce.has(key)) return
+  if (loggedOnce.size >= LOG_MAX) loggedOnce.delete(loggedOnce.keys().next().value!)
+  loggedOnce.set(key, now)
+  await $.ui.log(text)
 }
 // Claude's own folder (CLAUDE_CONFIG_DIR, else ~/.claude) and the home folder.
 let claudeDir: string | undefined
@@ -153,6 +171,9 @@ let relayed = new Set<string>()
 const relayPool = (type: string) => (/codex/i.test(type) ? 'codex' : /agy|antigravity/i.test(type) ? 'agy' : undefined)
 // Bumped by register(), so work begun by an earlier load drops its result.
 let loadGen = 0
+// /clear keeps the hooks and polling timer, but invalidates work for the old conversation.
+let sessionGen = 0
+const isCurrent = (gen: number, session: number) => gen === loadGen && session === sessionGen
 
 const clip = (text: string, width: number) => {
   const flat = text.replace(/\s+/g, ' ').trim()
@@ -179,40 +200,60 @@ const isWindows = async ($: EngineInterface) => (await $.env.get('OS')) === 'Win
 
 // Home is USERPROFILE first on Windows (as Python and Claude Code take it; MSYS's HOME can differ),
 // HOME first elsewhere. Empty variables fall through.
-async function folders($: EngineInterface) {
+async function folders($: EngineInterface, gen: number) {
+  if (gen !== loadGen) return
   if (claudeDir && homeDir) return
   const home = (await $.env.get('HOME')) || ''
   const profile = (await $.env.get('USERPROFILE')) || ''
-  homeDir = (await isWindows($)) ? profile || home : home || profile
-  claudeDir = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${homeDir}/.claude`
+  const homePath = (await isWindows($)) ? profile || home : home || profile
+  const configPath = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${homePath}/.claude`
+  if (gen !== loadGen) return
+  homeDir = homePath
+  claudeDir = configPath
 }
 
-async function watchAgents($: EngineInterface) {
+async function watchAgents($: EngineInterface, gen: number, session: number) {
   const live = (await $.agent.list()).filter(isLive)
   const ids = new Set(live.map(a => a.id))
   const next: SubAgent[] = []
   for (const a of live) {
-    const said = await $.session.messages({ agentId: a.id })
-    const calls = Array.isArray(said) ? said.flatMap(m => m.toolUses) : []
-    const last = calls[calls.length - 1]
+    if (!isCurrent(gen, session)) return
+    let now: string | undefined
+    try {
+      const said = await $.session.messages({ agentId: a.id })
+      for (let i = Array.isArray(said) ? said.length - 1 : -1; i >= 0; i--) {
+        const calls = said[i]?.toolUses
+        const last = calls?.[calls.length - 1]
+        if (last) {
+          now = describe(last.tool, last.input)
+          break
+        }
+      }
+    } catch (err) {
+      // An agent may finish between listing and fetching its messages; inspect the others.
+      await logOnce($, `agent-boxes: agent inspection: ${String(err)}`, gen)
+      continue
+    }
     next.push({
       id: a.id,
       label: clip(a.name ?? a.description, 40),
       type: a.type,
       isNested: a.parentId !== undefined && ids.has(a.parentId),
-      now: last && describe(last.tool, last.input),
+      now,
     })
   }
-  await update($, subagents, old => (JSON.stringify(old) === JSON.stringify(next) ? old : next))
+  if (isCurrent(gen, session)) await update($, subagents, old => (!isCurrent(gen, session) || JSON.stringify(old) === JSON.stringify(next) ? old : next))
 }
 
 // This session's task list, as Claude Code keeps it: <claude dir>/tasks/<session id>/<n>.json.
-async function readTasks($: EngineInterface) {
-  await folders($)
+async function readTasks($: EngineInterface, gen: number, session: number) {
+  await folders($, gen)
+  if (!isCurrent(gen, session)) return
   const folder = `${claudeDir}/tasks/${await $.session.id()}`
   const next: Task[] = []
   if (await $.fs.exists(folder)) {
     for (const entry of await $.fs.list(folder)) {
+      if (!isCurrent(gen, session)) return
       if (entry.kind !== 'file' || !entry.name.endsWith('.json')) continue
       try {
         const t = JSON.parse(await $.fs.read(`${folder}/${entry.name}`)) as Record<string, unknown>
@@ -230,13 +271,13 @@ async function readTasks($: EngineInterface) {
     }
   }
   next.sort((a, b) => (Number(a.id) || 0) - (Number(b.id) || 0))
-  await update($, tasks, old => (JSON.stringify(old) === JSON.stringify(next) ? old : next))
+  if (isCurrent(gen, session)) await update($, tasks, old => (!isCurrent(gen, session) || JSON.stringify(old) === JSON.stringify(next) ? old : next))
 }
 
 // Runs the summary for the turn `gen`, then once more for a turn that ended while it ran.
 // A prompt submitted meanwhile cancels the queued one (prompt.submit clears queuedGen).
-async function briefing($: EngineInterface, gen: number) {
-  if (!config.brief) return
+async function briefing($: EngineInterface, gen: number, workerGen: number) {
+  if (workerGen !== loadGen || !config.brief) return
   if (isBriefing) {
     queuedGen = gen
     return
@@ -244,19 +285,43 @@ async function briefing($: EngineInterface, gen: number) {
   isBriefing = true
   try {
     let next: number | undefined = gen
-    while (next !== undefined) {
+    while (workerGen === loadGen && next !== undefined) {
       queuedGen = undefined
-      await briefOnce($, next)
+      await briefOnce($, next, workerGen)
+      if (workerGen !== loadGen) return
       next = queuedGen
     }
   } finally {
-    isBriefing = false
+    if (workerGen === loadGen) isBriefing = false
   }
 }
 
+const briefText = (text: string) => text.replace(/<{3,}|>{3,}/g, s => s.replace(/</g, '‹').replace(/>/g, '›'))
+
+// Read only the first balanced object, ignoring braces and escaped quotes in JSON strings.
+function firstObject(text: string) {
+  const start = text.indexOf('{')
+  if (start < 0) return undefined
+  let depth = 0
+  let quoted = false
+  let escaped = false
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (quoted) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '"') quoted = false
+    } else if (ch === '"') quoted = true
+    else if (ch === '{') depth++
+    else if (ch === '}' && --depth === 0) return text.slice(start, i + 1)
+  }
+  return undefined
+}
+
 // Asks a small model what the session is doing and what to do after, from the last request and reply.
-async function briefOnce($: EngineInterface, gen: number) {
-  if (gen !== turnGen) return
+async function briefOnce($: EngineInterface, gen: number, workerGen: number) {
+  const session = sessionGen
+  if (workerGen !== loadGen || gen !== turnGen) return
   try {
     const said = await $.session.messages()
     let at = said.length - 1
@@ -270,11 +335,16 @@ async function briefOnce($: EngineInterface, gen: number) {
       .join('\n')
     // The latest request has no answer yet: nothing to summarise.
     if (!reply.trim()) return
-    await readTasks($)
-    if (gen !== turnGen) return
+    if (workerGen !== loadGen || gen !== turnGen) return
+    if (await isPlaced($)) {
+      if (!isCurrent(workerGen, session) || gen !== turnGen) return
+      await readTasks($, workerGen, session)
+    }
+    if (workerGen !== loadGen || gen !== turnGen) return
     const list = await read($, tasks)
+    if (workerGen !== loadGen || gen !== turnGen) return
     const listed = list.length
-      ? `Task list:\n${list.map(t => `- [${t.status}] ${t.subject}`).join('\n')}\n\n`
+      ? `Task list:\n<<<${briefText(list.map(t => `- [${t.status}] ${t.subject}`).join('\n'))}>>>\n\n`
       : ''
     const r = await $.model.complete({
       model: config.briefModel,
@@ -282,16 +352,16 @@ async function briefOnce($: EngineInterface, gen: number) {
       timeoutMs: 30000,
       system: 'You summarise a live coding session for a narrow status side bar. Reply with one JSON object and nothing else.',
       prompt:
-        `The user's latest request:\n<<<${asked.text.slice(-2500)}>>>\n\n` +
-        `The assistant's reply so far:\n<<<${reply.slice(-5000)}>>>\n\n${listed}` +
+        `The user's latest request:\n<<<${briefText(asked.text.slice(-2500))}>>>\n\n` +
+        `The assistant's reply so far:\n<<<${briefText(reply.slice(-5000))}>>>\n\n${listed}` +
         'Return {"task": string (8 words max: what is being worked on now), ' +
         '"steps": string[] (up to 3 remaining steps, 8 words max each; [] when done), ' +
         '"next": string (12 words max: the most useful thing to do after this, recommended to the user), ' +
         '"why": string (12 words max), ' +
         '"waiting": boolean (true when the reply ends asking the user to answer or decide something)}',
     })
-    if (!r.isAnswered || gen !== turnGen) return
-    const json = r.text.match(/\{[\s\S]*\}/)?.[0]
+    if (!r.isAnswered || workerGen !== loadGen || gen !== turnGen) return
+    const json = firstObject(r.text)
     if (!json) return
     const got = JSON.parse(json) as Record<string, unknown>
     const text = (v: unknown) => (typeof v === 'string' ? v : '')
@@ -302,28 +372,36 @@ async function briefOnce($: EngineInterface, gen: number) {
       why: text(got.why) || undefined,
       isWaiting: got.waiting === true,
     }
-    await update($, brief, () => next)
+    await update($, brief, old => (workerGen === loadGen && gen === turnGen ? next : old))
   } catch (err) {
-    $.ui.log(`agent-boxes: brief failed: ${String(err)}`)
+    await logOnce($, `agent-boxes: brief failed: ${String(err)}`, workerGen)
   }
 }
 
 // The user answered: drop the waiting marker, any summary in flight and any queued.
-async function clearWaiting($: EngineInterface) {
+async function clearWaiting($: EngineInterface, gen: number) {
+  if (gen !== loadGen) return
+  const session = sessionGen
   turnGen++
   queuedGen = undefined
-  await update($, brief, old => (old?.isWaiting ? { ...old, isWaiting: false } : old))
+  await update($, brief, old => (isCurrent(gen, session) && old?.isWaiting ? { ...old, isWaiting: false } : old))
 }
 
 // After /clear the conversation is new: drop the old one's summary and task list.
-async function forget($: EngineInterface) {
+async function forget($: EngineInterface, gen: number) {
+  if (gen !== loadGen) return
+  const session = ++sessionGen
   turnGen++
   queuedGen = undefined
-  await update($, brief, () => null)
-  await update($, tasks, () => [])
+  isPollQueued = false
+  relayed.clear()
+  await update($, brief, old => (isCurrent(gen, session) ? null : old))
+  if (isCurrent(gen, session)) await update($, tasks, old => (isCurrent(gen, session) ? [] : old))
 }
 
-async function measure($: EngineInterface, rateLimits?: SessionRateLimit[]) {
+async function measure($: EngineInterface, gen: number, rateLimits?: SessionRateLimit[]) {
+  if (gen !== loadGen) return
+  const session = sessionGen
   try {
     const usage = await $.session.usage()
     const limits = rateLimits ?? usage.rateLimits
@@ -334,9 +412,9 @@ async function measure($: EngineInterface, rateLimits?: SessionRateLimit[]) {
       sevenDay: windowOf(limits, 'seven_day'),
       windows: { '5h': rawWindow(limits, 'five_hour'), '7d': rawWindow(limits, 'seven_day') },
     }
-    await update($, claude, old => (JSON.stringify(old) === JSON.stringify(next) ? old : next))
+    if (isCurrent(gen, session)) await update($, claude, old => (!isCurrent(gen, session) || JSON.stringify(old) === JSON.stringify(next) ? old : next))
   } catch (err) {
-    logOnce($, `agent-boxes: ${String(err)}`)
+    await logOnce($, `agent-boxes: usage: ${String(err)}`, gen)
   }
 }
 
@@ -369,10 +447,12 @@ async function isStub($: EngineInterface, cmd: string[]) {
 }
 
 // The first candidate that passes the version check.
-async function discover($: EngineInterface) {
+async function discover($: EngineInterface, gen: number) {
   for (const cmd of await candidates($)) {
+    if (gen !== loadGen) return
     try {
       if (await isStub($, cmd)) continue
+      if (gen !== loadGen) return
       const ran = await $.process.run([...cmd, '-E', '-c', VERSION_CHECK], { timeoutMs: 10000 })
       if (ran.exitCode === 0) return cmd
     } catch {
@@ -386,14 +466,14 @@ const retryMs = () => Math.min(RETRY_MAX_MS, RETRY_MS * 2 ** Math.max(0, discove
 
 // Starts discovery in the background, outside the poll, so tasks and subagents keep their cadence;
 // after a failure, not before the back-off. A result asks for a poll at once.
-async function startDiscovery($: EngineInterface) {
-  if (isDiscovering) return
+async function startDiscovery($: EngineInterface, gen: number) {
+  if (gen !== loadGen || isDiscovering) return
   const now = await $.clock.now()
+  if (gen !== loadGen || isDiscovering) return
   if (lookedAtMs !== undefined && now - lookedAtMs < retryMs()) return
   lookedAtMs = now
   isDiscovering = true
-  const gen = loadGen
-  void discover($)
+  void discover($, gen)
     .catch(() => undefined)
     .then(found => {
       if (gen !== loadGen) return
@@ -404,22 +484,26 @@ async function startDiscovery($: EngineInterface) {
       } else {
         discoverFails++
       }
-      void poll($, true)
+      void poll($, true, gen)
     })
 }
 
 // Which tools are installed, from their folders alone (CODEX_HOME as codex_scan.py reads it);
 // looked at again every TOOLS_MS, so a tool installed mid-session shows up.
-async function installed($: EngineInterface) {
+async function installed($: EngineInterface, gen: number) {
   const now = await $.clock.now()
+  if (gen !== loadGen) return undefined
   if (tools && now - tools.atMs < TOOLS_MS) return tools
-  await folders($)
+  await folders($, gen)
+  if (gen !== loadGen) return undefined
   const codexHome = (await $.env.get('CODEX_HOME')) || `${homeDir}/.codex`
-  tools = {
+  const found = {
     codex: await $.fs.exists(codexHome),
     agy: await $.fs.exists(`${homeDir}/.gemini/antigravity-cli`),
     atMs: now,
   }
+  if (gen !== loadGen) return undefined
+  tools = found
   return tools
 }
 
@@ -438,12 +522,14 @@ const noPython = (has: { codex: boolean; agy: boolean }): Scan => {
 
 // A scan that was slow or failed with Python known: the last good boxes with a hint, and a back-off.
 // The hint shows on the boxes in the pane, not in the transcript.
-async function trouble($: EngineInterface, hint: string): Promise<Scan> {
+async function trouble($: EngineInterface, hint: string, gen: number, session: number): Promise<Scan | undefined> {
+  if (!isCurrent(gen, session)) return undefined
   failures++
   skipScans = Math.min(6, 2 ** (failures - 1))
   let base = lastGood
   if (!base) {
-    const has = await installed($)
+    const has = await installed($, gen)
+    if (!has || !isCurrent(gen, session)) return undefined
     base = { codex: box(has.codex), agy: box(has.agy) }
   }
   return { ...base, codex: { ...base.codex, stale: hint }, agy: { ...base.agy, stale: hint } }
@@ -453,22 +539,25 @@ async function trouble($: EngineInterface, hint: string): Promise<Scan> {
 const isLost = (text: string) => /ENOENT|spawn|not recognized|cannot find|9009/i.test(text)
 
 // Runs the bundled scan under the cached Python; undefined keeps the boxes as they are.
-async function scanNow($: EngineInterface): Promise<Scan | undefined> {
-  const has = await installed($)
+async function scanNow($: EngineInterface, gen: number, session: number): Promise<Scan | undefined> {
+  const has = await installed($, gen)
+  if (!has || !isCurrent(gen, session)) return undefined
   // Neither tool has a folder: no Python is looked for or run.
   if (!has.codex && !has.agy) return { codex: box(false), agy: box(false) }
   const cmd = python
   if (!cmd) {
-    await startDiscovery($)
+    await startDiscovery($, gen)
+    if (!isCurrent(gen, session)) return undefined
     // Until a discovery has failed, the boxes keep saying "scanning…".
     return discoverFails > 0 && !isDiscovering ? noPython(has) : undefined
   }
   const script = `${$.plugin.root}/scripts/boxes.py`
   // The first loss rediscovers at once; another within RETRY_MS (an interpreter that passes the
   // version check but cannot run the scan) waits out the back-off instead of looping.
-  const lost = async (why: string) => {
-    logOnce($, `agent-boxes: ${cmd.join(' ')} would not start; looking for Python again`)
+  const lost = async () => {
+    await logOnce($, `agent-boxes: ${cmd.join(' ')} would not start; looking for Python again`, gen)
     const now = await $.clock.now()
+    if (!isCurrent(gen, session)) return undefined
     const isRepeat = lostAtMs !== undefined && now - lostAtMs < RETRY_MS
     lostAtMs = now
     python = undefined
@@ -476,59 +565,84 @@ async function scanNow($: EngineInterface): Promise<Scan | undefined> {
       lookedAtMs = undefined
       discoverFails = 0
     }
-    await startDiscovery($)
-    return isRepeat ? trouble($, 'Python would not start, retrying') : undefined
+    await startDiscovery($, gen)
+    return isRepeat ? trouble($, 'Python would not start, retrying', gen, session) : undefined
   }
   let ran
   try {
-    ran = await $.process.run([...cmd, '-E', script, await $.session.id()], { timeoutMs: 20000 })
+    const sessionId = await $.session.id()
+    if (!isCurrent(gen, session)) return undefined
+    ran = await $.process.run([...cmd, '-E', script, sessionId], { timeoutMs: 20000 })
   } catch (err) {
+    if (!isCurrent(gen, session)) return undefined
     const why = String(err)
-    if (/time/i.test(why)) return trouble($, 'scan slow, retrying')
-    if (isLost(why)) return lost(why)
-    return trouble($, 'scan failed, retrying')
+    if (/time/i.test(why)) return trouble($, 'scan slow, retrying', gen, session)
+    if (isLost(why)) return lost()
+    return trouble($, 'scan failed, retrying', gen, session)
   }
-  if (ran.exitCode === 9009 || /not recognized/i.test(ran.stderr)) return lost(`exit ${ran.exitCode}`)
-  if (ran.exitCode !== 0) return trouble($, `scan failed (exit ${ran.exitCode}), retrying`)
+  if (!isCurrent(gen, session)) return undefined
+  if (ran.exitCode === 9009 || /not recognized/i.test(ran.stderr)) return lost()
+  if (ran.exitCode !== 0) return trouble($, `scan failed (exit ${ran.exitCode}), retrying`, gen, session)
   let got: Scan
   try {
     got = JSON.parse(ran.stdout) as Scan
     if (typeof got?.codex !== 'object' || typeof got?.agy !== 'object' || !got.codex || !got.agy) throw new Error('shape')
   } catch {
-    return trouble($, 'scan gave bad JSON, retrying')
+    return trouble($, 'scan gave bad JSON, retrying', gen, session)
   }
   failures = 0
+  skipScans = 0
   lastGood = got
   return got
 }
 
 const isPlaced = async ($: EngineInterface) => (await $.ui.panes()).some(p => p.id === PANE && p.isPlaced)
 
-async function pollOnce($: EngineInterface) {
+async function pollOnce($: EngineInterface, gen: number, isUrgent: boolean) {
+  const session = sessionGen
   try {
-    await readTasks($)
-    await watchAgents($)
-    // No scan while the pane waits undrawn; its first render asks for one.
-    if (!(await isPlaced($))) {
-      scannedPlaced = false
-      return
+    const placed = await isPlaced($)
+    if (!isCurrent(gen, session)) return
+    scannedPlaced = placed
+    let hiddenAt: number | undefined
+    if (placed) {
+      try {
+        await readTasks($, gen, session)
+      } catch (err) {
+        await logOnce($, `agent-boxes: tasks: ${String(err)}`, gen)
+      }
+      if (!isCurrent(gen, session)) return
+      try {
+        await watchAgents($, gen, session)
+      } catch (err) {
+        await logOnce($, `agent-boxes: agents: ${String(err)}`, gen)
+      }
+    } else {
+      const now = await $.clock.now()
+      if (!isCurrent(gen, session)) return
+      // Quota is needed by the router even if the pane has never been opened.
+      if (!isUrgent && hiddenPolledAtMs !== undefined && now - hiddenPolledAtMs < HIDDEN_POLL_MS) return
+      hiddenAt = now
     }
-    scannedPlaced = true
-    if (skipScans > 0) {
+    if (!isCurrent(gen, session)) return
+    if (!isUrgent && skipScans > 0) {
       skipScans--
       return
     }
-    const next = await scanNow($)
+    if (hiddenAt !== undefined) hiddenPolledAtMs = hiddenAt
+    const next = await scanNow($, gen, session)
+    if (!isCurrent(gen, session)) return
     for (const a of [...(next?.codex.agents ?? []), ...(next?.agy.agents ?? [])]) if (a.via) relayed.add(a.via)
-    if (next) await update($, scan, old => (JSON.stringify(old) === JSON.stringify(next) ? old : next))
-    if (next) await refreshRouter($, lastGood ?? undefined)
+    if (next) await update($, scan, old => (!isCurrent(gen, session) || JSON.stringify(old) === JSON.stringify(next) ? old : next))
+    if (next && isCurrent(gen, session)) await refreshRouter($, next)
   } catch (err) {
-    logOnce($, `agent-boxes: ${String(err)}`)
+    await logOnce($, `agent-boxes: scan: ${String(err)}`, gen)
   }
 }
 
 // One poll at a time; an urgent one asked for meanwhile runs right after.
-async function poll($: EngineInterface, isUrgent = false) {
+async function poll($: EngineInterface, isUrgent: boolean, gen: number) {
+  if (gen !== loadGen) return
   if (isScanning) {
     if (isUrgent) isPollQueued = true
     return
@@ -537,23 +651,27 @@ async function poll($: EngineInterface, isUrgent = false) {
   try {
     do {
       isPollQueued = false
-      await pollOnce($)
-    } while (isPollQueued)
+      await pollOnce($, gen, isUrgent)
+      isUrgent = isPollQueued
+    } while (gen === loadGen && isPollQueued)
   } finally {
-    isScanning = false
+    if (gen === loadGen) isScanning = false
   }
 }
 
 export const register: Register = (on, given) => {
   options = given
   config = readConfig(options)
-  loadGen++
+  const gen = ++loadGen
+  loggedOnce.clear()
   isScanning = false
   isPollQueued = false
   scannedPlaced = false
+  hiddenPolledAtMs = undefined
   isBriefing = false
   queuedGen = undefined
   turnGen = 0
+  sessionGen = 0
   python = undefined
   lookedAtMs = undefined
   discoverFails = 0
@@ -568,13 +686,18 @@ export const register: Register = (on, given) => {
   isAutoOpenDecided = false
   relayed = new Set()
   on('session.start', async ($, e, next) => {
-    await loadConfig($)
+    const session = sessionGen
+    if (!isCurrent(gen, session)) return next(e)
+    await loadConfig($, gen)
+    if (!isCurrent(gen, session)) return next(e)
     await $.command.register({ name: 'agent-boxes', description: 'Show the agent boxes side bar' })
-    void measure($)
-    void poll($)
-    void briefing($, turnGen)
-    $.clock.every(POLL_MS, () => void poll($))
-    await folders($)
+    if (!isCurrent(gen, session)) return next(e)
+    void measure($, gen)
+    void poll($, false, gen)
+    void briefing($, turnGen, gen)
+    $.clock.every(POLL_MS, () => void poll($, false, gen))
+    await folders($, gen)
+    if (!isCurrent(gen, session)) return next(e)
     await startRouter($, claudeDir ?? '').catch(err => $.ui.log(`agent-boxes: router: ${String(err)}`))
 
     return next(e)
@@ -586,7 +709,7 @@ export const register: Register = (on, given) => {
   // through untouched, until it says; /agent-boxes still opens the pane anywhere.
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
     const isFullscreen = e.viewport?.isFullscreen
-    if (!isAutoOpenDecided && isFullscreen !== undefined) {
+    if (gen === loadGen && !isAutoOpenDecided && isFullscreen !== undefined) {
       isAutoOpenDecided = true
       if (isFullscreen) void $.ui.open({ id: PANE, title: 'Agents', columns: config.width }).catch(() => undefined)
     }
@@ -595,13 +718,15 @@ export const register: Register = (on, given) => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    const session = sessionGen
     const done = await next(e)
+    if (!isCurrent(gen, session)) return done
     if (e.agentId === undefined) {
       turnGen++
-      void briefing($, turnGen)
+      void briefing($, turnGen, gen)
       await turnDone($).catch(() => undefined)
     }
-    await agentDone($, e.agentId).catch(() => undefined)
+    if (isCurrent(gen, session)) await agentDone($, e.agentId, e.agentId === undefined ? undefined : e.answer).catch(() => undefined)
 
     return done
   })
@@ -609,9 +734,11 @@ export const register: Register = (on, given) => {
   // Observe only: the prompt passes through untouched.
   // A /clear starts a new session id with no session.start, so the old summary would linger.
   on('session.end', async ($, e, next) => {
+    if (gen !== loadGen) return next(e)
     if (e.reason === 'clear') {
-      await forget($)
-      await forgetRoute($).catch(() => undefined)
+      const session = sessionGen + 1
+      await forget($, gen)
+      if (isCurrent(gen, session)) await forgetRoute($).catch(() => undefined)
     }
 
     return next(e)
@@ -619,43 +746,59 @@ export const register: Register = (on, given) => {
 
   // A user's prompt may get the router's hidden note.
   on('prompt.submit', async ($, e, next) => {
-    if (!e.isMeta) await clearWaiting($)
+    const session = sessionGen
+    if (!isCurrent(gen, session)) return next(e)
+    if (!e.isMeta) await clearWaiting($, gen)
+    if (!isCurrent(gen, session)) return next(e)
     const note = await routeNote($, e)
+    if (!isCurrent(gen, session)) return next(e)
 
     return next(note ? { ...e, context: [...(e.context ?? []), note] } : e)
   })
 
   on('prompt.compose', async ($, e, next) => {
+    const session = sessionGen
     const got = await next(e)
+    if (!isCurrent(gen, session)) return got
     const policy = routingPolicy(e)
 
     return policy ? { sections: [...got.sections, policy] } : got
   })
 
   on('agent.spawn', async ($, e, next) => {
+    const session = sessionGen
+    if (!isCurrent(gen, session)) return next(e)
     const ran = await steered($, e)
+    if (!isCurrent(gen, session)) return next(e)
     const done = await next(ran)
-    await spawnedAgent($, e, ran, done).catch(() => undefined)
+    if (isCurrent(gen, session)) await spawnedAgent($, e, ran, done).catch(() => undefined)
 
     return done
   })
 
-  on('command.run', { command: 'route' }, async ($, e) => ({ text: await routeCommand($, e.args) }))
+  on('command.run', { command: 'route' }, async ($, e, next) => {
+    if (gen !== loadGen) return next(e)
+    return { text: await routeCommand($, e.args) }
+  })
 
-  on('command.run', { command: 'agent-boxes' }, async $ => {
+  on('command.run', { command: 'agent-boxes' }, async ($, e, next) => {
+    const session = sessionGen
+    if (!isCurrent(gen, session)) return next(e)
     await $.ui.open({ id: PANE, title: 'Agents', columns: config.width })
-    if (!scannedPlaced) void poll($, true)
+    if (isCurrent(gen, session) && !scannedPlaced) void poll($, true, gen)
 
     return { text: 'Agent boxes opened.' }
   })
 
   on('session.measure', async ($, e, next) => {
-    await measure($, e.rateLimits)
+    await measure($, gen, e.rateLimits)
 
     return next(e)
   })
 
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    const session = sessionGen
+    if (!isCurrent(gen, session)) return next(e)
     const { Box, Text } = $.ui.resolve(e)
     const c = await read($, claude)
     const s = await read($, scan)
@@ -663,12 +806,13 @@ export const register: Register = (on, given) => {
     const b = await read($, brief)
     const list = await read($, tasks)
     const r = await read($, route)
+    if (!isCurrent(gen, session)) return next(e)
     const BG = config.background === 'black' ? 'black' : undefined
     // On black, explicit light text so light themes stay readable; dock keeps the theme's.
     const FG = BG ? '#e6e6e6' : undefined
     const dim = BG ? { color: '#8b949e' } : { dimColor: true }
     // Placed now but not scanned while placed: scan at once.
-    if (!scannedPlaced) void poll($, true)
+    if (!scannedPlaced) void poll($, true, gen)
 
     // The 7d meter fills the box less its border, padding and the "7d 100%" label; the 5h one is half that.
     const meterWidth = Math.max(8, e.props.bodyColumns - 4 - 9)
@@ -816,6 +960,12 @@ export const register: Register = (on, given) => {
     // The router: its mode in the title; the last pick and fallback, or before any routed
     // prompt the pool best placed now. One line when the side bar is short.
     const routed = (x: Route) => (x.size ? `${x.category} (${x.size})` : x.category)
+    const pickAge = r?.pick ? Math.max(0, (await $.clock.now()) - r.atMs) : 0
+    const oldPick = pickAge >= PICK_AGE_MS
+    const pickStyle = oldPick ? dim : { color: FG }
+    const age = oldPick ? ` · ${Math.floor(pickAge / 60000)}m ago` : ''
+    // In-loop placements have no delegated fallback, even if the ranking has an alternate.
+    const fallback = r?.pick.startsWith('this loop (') ? '' : r?.fallback?.trim()
     const routerBox = r
       ? plain(
           'router',
@@ -827,17 +977,17 @@ export const register: Register = (on, given) => {
           !r.pick ? (
             <Text {...dim}>{r.lead || 'waiting for the first prompt'}</Text>
           ) : e.props.scroll.bodyRows < SHORT_ROWS ? (
-            <Text color={FG}>
-              {r.pick} <Text {...dim}>· {r.category}{r.fallback ? ` · alt ${r.fallback}` : ''}</Text>
+            <Text {...pickStyle}>
+              {r.pick} <Text {...dim}>· {r.category}{age}{fallback ? ` · alt ${fallback}` : ''}</Text>
             </Text>
           ) : (
             <Box flexDirection="column" backgroundColor={BG}>
-              <Text color={FG}>
-                {r.pick} <Text {...dim}>· {routed(r)}</Text>
+              <Text {...pickStyle}>
+                {r.pick} <Text {...dim}>· {routed(r)}{age}</Text>
               </Text>
               <Text {...dim}>
                 {r.why}
-                {r.fallback ? ` · alt ${r.fallback}` : ''}
+                {fallback ? ` · alt ${fallback}` : ''}
               </Text>
             </Box>
           ),

@@ -112,7 +112,7 @@ def codex_box(session_id, rows=None, prepare=False):
     now = scan["nowMs"]
     five = next((w for w in scan["limits"] if w["minutes"] == 300), None)
     week = next((w for w in scan["limits"] if w["minutes"] == 10080), None)
-    return {
+    box = {
         "installed": True,
         "limits": [f"{window_text('5h', five, now)} · {window_text('7d', week, now)}"],
         "agents": agent_rows(scan["agents"], now),
@@ -120,6 +120,9 @@ def codex_box(session_id, rows=None, prepare=False):
         "sevenDay": window_used(week, now),
         "windows": {"5h": window_raw(five, now), "7d": window_raw(week, now)},
     }
+    if scan.get("stale"):
+        box["stale"] = scan["stale"]
+    return box
 
 
 def agy_box(session_id, rows=None, prepare=False):
@@ -163,6 +166,8 @@ def agy_box(session_id, rows=None, prepare=False):
     }
     if not groups and not agy_usage.AGY:
         box["hint"] = "quota needs agy on PATH"
+    if scan.get("stale"):
+        box["stale"] = scan["stale"]
     if groups:
         at = usage.get("lastSuccessAtMs", usage.get("atMs", 0) if not usage.get("failedAtMs") else 0)
         if not at:

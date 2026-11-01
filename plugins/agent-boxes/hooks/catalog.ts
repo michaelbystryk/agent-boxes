@@ -92,7 +92,8 @@ export const CATEGORIES: Category[] = [
   {
     id: 'bugfix',
     title: 'hard bug fix',
-    words: /\b(bug|crash(es|ing)?|exception|stack ?trace|regression|broken|doesn'?t work|not working|fails?|failing|error)\b/i,
+    // A bare "error" or "fails" is often a question ("what does this error mean"): only with a verb of fixing.
+    words: /\b(bug|crash(es|ing)?|exception|stack ?trace|regression|broken|doesn'?t work|not working|failing|(fix|debug|solve|resolve|track down)\b[^.?!]{0,40}\b(errors?|fail(s|ures?)?))\b/i,
     ranked: ['argon', 'sonnet', 'opus'],
   },
   {

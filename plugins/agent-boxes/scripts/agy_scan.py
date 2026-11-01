@@ -83,14 +83,18 @@ def conversations():
             return []
         names = ("conversation_id", "title", "preview", "step_count", "last_modified_time", "workspace_uris",
                  "status", "agent_name", "parent_conversation_id", "not_fully_idle", "killed", "last_user_input_time", "model", "effort")
+        # SQLite's julianday normalizes RFC3339 offsets/fractions before comparison;
+        # lexical comparisons mix 'Z', '+00:00', and fractional precision incorrectly.
+        since = time.time() - LOOKBACK_MS / 1000
         cur = con.execute(
             "select " + ", ".join(n if n in cols else "NULL as " + n for n in names)
-            + " from conversation_summaries"
+            + " from conversation_summaries where julianday(last_modified_time) > julianday(?, 'unixepoch')"
+            + " order by julianday(last_modified_time) desc limit 400", (since,)
         )
         cols = [c[0] for c in cur.description]
         rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-    except sqlite3.Error:
-        return []
+    except sqlite3.Error as e:
+        return codex_scan.ScanRows(stale="database locked" if "locked" in str(e).lower() else "database unavailable")
     finally:
         if con is not None:
             con.close()
@@ -131,6 +135,8 @@ def running(r, now_ms):
 def scan(session_id, rows=None):
     now_ms = int(time.time() * 1000)
     rows = conversations() if rows is None else rows
+    if getattr(rows, "stale", None):
+        return codex_scan.finish_scan("agy", session_id, {"nowMs": now_ms, "agents": []}, rows.stale)
     calls = session_calls(session_id) if rows else []
     active = rows and (any(running(r, now_ms) for r in rows) or any(c.get("alive") for c in calls))
     mine = ours(rows, calls) if active else {}
@@ -155,5 +161,4 @@ def scan(session_id, rows=None):
         })
     agents += bench_scan.runs(session_id, "agy")
     agents.sort(key=lambda a: a["startedAtMs"])
-    return {"nowMs": now_ms, "agents": agents}
-
+    return codex_scan.finish_scan("agy", session_id, {"nowMs": now_ms, "agents": agents})
