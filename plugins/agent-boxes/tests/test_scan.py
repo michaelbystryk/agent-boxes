@@ -275,6 +275,27 @@ class AttributionTests(Files):
         self.assertEqual(call["brief"], "implement exec support")
         self.assertEqual(set(codex.ours([self.row(prompt="implement exec support")], [call])), {"run"})
 
+    def test_fd_redirects_stay_out_of_the_prompt(self):
+        for tail in ("2>&1", "2>/dev/null", "2> err.log", "2>>err.log", "2>&-", "2>&1 | tee log", "> out.txt 2>&1"):
+            self.assertEqual(self.call('codex exec "the task" ' + tail)["prompt"], "the task", tail)
+
+    def test_digits_that_are_not_an_fd_stay_in_the_prompt(self):
+        self.assertEqual(self.call('codex exec "the task" 2 > out.txt')["prompt"], "the task 2")
+        self.assertEqual(self.call('codex exec "2" > out.txt')["prompt"], "2")
+        self.assertEqual(self.call('codex exec "2">out.txt')["prompt"], "2")
+
+    def test_stdin_appended_to_the_prompt_pairs_after_an_fd_redirect(self):
+        (self.root / "brief.txt").write_text("the brief")
+        run = self.row(prompt="the task\n\n<stdin>\nthe brief\n</stdin>")
+        for command in ('codex exec "the task" 2>&1 < brief.txt', 'cat brief.txt | codex exec "the task" 2>&1'):
+            call = self.call(command)
+            self.assertEqual(call["brief"], "the brief", command)
+            self.assertEqual(set(codex.ours([run], [call])), {"run"}, command)
+
+    def test_fd_duplication_does_not_end_the_command(self):
+        (self.root / "brief.txt").write_text("the brief")
+        self.assertEqual(self.call("cat brief.txt 2>&1 | codex exec -")["brief"], "the brief")
+
     def test_brief_is_read_from_the_shell_cwd_not_codex_cd(self):
         sub = self.root / "rel"
         sub.mkdir()

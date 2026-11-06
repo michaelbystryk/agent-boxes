@@ -726,17 +726,17 @@ def expand(text, env):
 def shell_segments(command, powershell=False):
     """Words and boundaries, keeping quoted newlines and heredoc bodies intact."""
     segments, words, word = [], [], []
-    quote, started, i = None, False, 0
+    quote, started, quoted, i = None, False, False, 0
     body_tag, strip_tabs = None, False
 
     def finish_word():
-        nonlocal word, started, body_tag, strip_tabs
+        nonlocal word, started, quoted, body_tag, strip_tabs
         if started:
             value = "".join(word)
             if words and words[-1] in ("<<", "<<-"):
                 body_tag, strip_tabs = value, words[-1] == "<<-"
             words.append(value)
-        word, started = [], False
+        word, started, quoted = [], False, False
 
     while i < len(command):
         ch = command[i]
@@ -757,7 +757,7 @@ def shell_segments(command, powershell=False):
             i += 1
             continue
         if ch in ('"', "'"):
-            quote, started = ch, True
+            quote, started, quoted = ch, True, True
         elif ch == "#" and not started:
             i = command.find("\n", i)
             if i < 0:
@@ -791,6 +791,9 @@ def shell_segments(command, powershell=False):
                 i = end
                 continue
         elif ch in "<>":
+            # Digits touching the operator name a file descriptor (`2>`), not a word.
+            if not quoted and re.fullmatch(r"[0-9]+", "".join(word)):
+                word, started = [], False
             finish_word()
             op = ch
             if i + 1 < len(command) and command[i + 1] == ch:
@@ -799,6 +802,8 @@ def shell_segments(command, powershell=False):
                 if op == "<<" and i + 1 < len(command) and command[i + 1] == "-":
                     op += "-"
                     i += 1
+            elif command.startswith("&", i + 1):
+                i += 1  # `2>&1`: the `&` belongs to the redirect, the command goes on
             words.append(op)
         else:
             word.append(ch)
