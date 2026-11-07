@@ -126,7 +126,7 @@ The note covers only the sandboxed launches, so a run without a sandbox is still
 | Option | Default | What it does |
 | --- | --- | --- |
 | `mode` | `"advise"` | `advise` adds the policy and the per-prompt note. `steer` also rewrites a spawn whose pool is out of quota to the category's best live executor, with a `⇄ worker → …` toast. Forks, resumes, teammates and workflow agents are never rewritten. `off` does nothing and hides the router box. |
-| `disabled` | `[]` | Executor ids to leave out: `haiku`, `sonnet`, `opus`, `fable`, `sol`, `astra`, `argon`, `flash`, `opus-agy`. |
+| `disabled` | `[]` | Executor ids to leave out: `haiku`, `sonnet`, `opus`, `fable`, `sol`, `astra`, `argon`, `flash`, `opus-agy`. Leaving out all of a tool's executors also hides its box and stops scanning it: `sol` and `astra` for Codex; `argon`, `flash` and `opus-agy` for Antigravity. |
 | `enabled` | `[]` | Executors that are off by default and that you want: `fable`. |
 | `order` | `{}` | Per category id, a ranking that replaces the catalog's, by executor id. |
 | `classify` | `true` | Ask a small model when no keyword matches. Turn off to label those prompts `general`. |

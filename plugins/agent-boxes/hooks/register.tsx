@@ -2,6 +2,9 @@ import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, PluginOptions, Register, RenderChildren, SessionRateLimit } from 'claude-code'
 
 import type { Brief, ClaudeBox, Route, Scan, SubAgent, Task, ToolBox, Window } from '../types'
+import { EXECUTORS } from './catalog'
+import type { Pool } from './catalog'
+import { readConfig as readRouterConfig } from './route'
 import {
   agentDone,
   forgetRoute,
@@ -44,8 +47,36 @@ const route = atom({ plugin: 'agent-boxes', key: 'route' } as const, null)
 // The options: the defaults below, changed by `<claude dir>/agent-boxes/config.json`, read once per
 // session. plugin.json declares no userConfig, because Claude Code asks for every option that has no
 // saved value when the plugin is installed, defaults or not.
-type Config = { brief: boolean; briefModel: string; width: number; background: 'black' | 'dock'; python: string }
-let config: Config = { brief: true, briefModel: 'haiku', width: 48, background: 'black', python: '' }
+type Tools = { codex: boolean; agy: boolean }
+type Config = {
+  brief: boolean
+  briefModel: string
+  width: number
+  background: 'black' | 'dock'
+  python: string
+  // Tools whose box is left out and whose quota and runs are not scanned.
+  hidden: Tools
+}
+let config: Config = {
+  brief: true,
+  briefModel: 'haiku',
+  width: 48,
+  background: 'black',
+  python: '',
+  hidden: { codex: false, agy: false },
+}
+
+// Each tool's router pools: Antigravity's Claude models run on its own quota.
+const TOOL_POOLS: Record<keyof Tools, Pool[]> = { codex: ['codex'], agy: ['agy', 'agy-claude'] }
+
+// A tool is hidden when the router has every one of its executors disabled
+// (`"router": { "disabled": ["sol", "astra"] }` for Codex): the user has said they don't use it.
+function hiddenTools(router: unknown): Tools {
+  const { disabled } = readRouterConfig(typeof router === 'string' ? { mode: router } : router)
+  const isOff = (key: keyof Tools) =>
+    EXECUTORS.filter(x => TOOL_POOLS[key].includes(x.pool)).every(x => disabled.includes(x.id))
+  return { codex: isOff('codex'), agy: isOff('agy') }
+}
 
 function readConfig(options: PluginOptions): Config {
   const str = (k: string, fallback: string) => (typeof options[k] === 'string' ? (options[k] as string) : fallback)
@@ -56,6 +87,7 @@ function readConfig(options: PluginOptions): Config {
     width: Math.min(120, Math.max(30, width)),
     background: options.background === 'dock' ? 'dock' : 'black',
     python: str('python', '').trim(),
+    hidden: hiddenTools(options.router),
   }
 }
 
@@ -488,12 +520,19 @@ async function startDiscovery($: EngineInterface, gen: number) {
     })
 }
 
+// A hidden tool counts as not installed: no box, and no Python run for it alone.
+const shown = <T extends Tools>(found: T): T => ({
+  ...found,
+  codex: found.codex && !config.hidden.codex,
+  agy: found.agy && !config.hidden.agy,
+})
+
 // Which tools are installed, from their folders alone (CODEX_HOME as codex_scan.py reads it);
 // looked at again every TOOLS_MS, so a tool installed mid-session shows up.
 async function installed($: EngineInterface, gen: number) {
   const now = await $.clock.now()
   if (gen !== loadGen) return undefined
-  if (tools && now - tools.atMs < TOOLS_MS) return tools
+  if (tools && now - tools.atMs < TOOLS_MS) return shown(tools)
   await folders($, gen)
   if (gen !== loadGen) return undefined
   const codexHome = (await $.env.get('CODEX_HOME')) || `${homeDir}/.codex`
@@ -504,7 +543,7 @@ async function installed($: EngineInterface, gen: number) {
   }
   if (gen !== loadGen) return undefined
   tools = found
-  return tools
+  return shown(tools)
 }
 
 const box = (isInstalled: boolean, error?: string): ToolBox => ({
@@ -590,6 +629,9 @@ async function scanNow($: EngineInterface, gen: number, session: number): Promis
   } catch {
     return trouble($, 'scan gave bad JSON, retrying', gen, session)
   }
+  // The scan reads both tools; a hidden one's box, quota and runs are dropped.
+  if (config.hidden.codex) got.codex = box(false)
+  if (config.hidden.agy) got.agy = box(false)
   failures = 0
   skipScans = 0
   lastGood = got
