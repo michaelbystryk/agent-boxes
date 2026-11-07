@@ -726,17 +726,17 @@ def expand(text, env):
 def shell_segments(command, powershell=False):
     """Words and boundaries, keeping quoted newlines and heredoc bodies intact."""
     segments, words, word = [], [], []
-    quote, started, i = None, False, 0
+    quote, started, quoted, i = None, False, False, 0
     body_tag, strip_tabs = None, False
 
     def finish_word():
-        nonlocal word, started, body_tag, strip_tabs
+        nonlocal word, started, quoted, body_tag, strip_tabs
         if started:
             value = "".join(word)
             if words and words[-1] in ("<<", "<<-"):
                 body_tag, strip_tabs = value, words[-1] == "<<-"
             words.append(value)
-        word, started = [], False
+        word, started, quoted = [], False, False
 
     while i < len(command):
         ch = command[i]
@@ -757,7 +757,7 @@ def shell_segments(command, powershell=False):
             i += 1
             continue
         if ch in ('"', "'"):
-            quote, started = ch, True
+            quote, started, quoted = ch, True, True
         elif ch == "#" and not started:
             i = command.find("\n", i)
             if i < 0:
@@ -791,6 +791,10 @@ def shell_segments(command, powershell=False):
                 i = end
                 continue
         elif ch in "<>":
+            # What touches the operator names its streams (`2>`, PowerShell's `*>`), not a word.
+            streams = "".join(word)
+            if not quoted and (re.fullmatch(r"[0-9]+", streams) or powershell and streams == "*"):
+                word, started = [], False
             finish_word()
             op = ch
             if i + 1 < len(command) and command[i + 1] == ch:
@@ -799,6 +803,9 @@ def shell_segments(command, powershell=False):
                 if op == "<<" and i + 1 < len(command) and command[i + 1] == "-":
                     op += "-"
                     i += 1
+            elif command.startswith("&", i + 1):
+                op += "&"  # `2>&1`, `<&-`: the `&` belongs to the redirect, the command goes on
+                i += 1
             words.append(op)
         else:
             word.append(ch)
@@ -849,7 +856,7 @@ def exec_args(words, env, call):
     positional, i, options = [], 0, True
     while i < len(words):
         word = words[i]
-        if word in ("<", ">", ">>", "<<", "<<-"):
+        if word in ("<", ">", ">>", "<<", "<<-", "<&", ">&"):
             break
         flag, sep, value = word.partition("=")
         if options and word == "--":
