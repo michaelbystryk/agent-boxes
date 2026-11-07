@@ -605,6 +605,38 @@ test('tools that are not installed get no box', async ($, on) => {
   await ui.unmount()
 })
 
+test("a tool whose executors are all disabled gets no box and no quota", async ($, on) => {
+  await start($, on, { config: { router: { disabled: ['sol', 'astra'] } } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ key: 'codex' })).toBeUndefined()
+  expect(await ui.find({ key: 'agy' })).toBeDefined()
+  expect(await ui.find({ key: 'claude' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /fix login/ })).toBeUndefined()
+  await ui.unmount()
+  expect(await submit($, SHADER)).not.toMatch(/codex/)
+})
+
+test("disabling only some of a tool's executors keeps its box", async ($, on) => {
+  await start($, on, { config: { router: { disabled: ['sol', 'argon', 'flash'] } } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ key: 'codex' })).toBeDefined()
+  expect(await ui.find({ key: 'agy' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('with every tool disabled, no Python runs at all', async ($, on) => {
+  const { argvs, clock } = await start($, on, {
+    config: { router: { disabled: ['sol', 'astra', 'argon', 'flash', 'opus-agy'] } },
+  })
+  await clock.advance(60000)
+  expect(argvs.length).toBe(0)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ key: 'codex' })).toBeUndefined()
+  expect(await ui.find({ key: 'agy' })).toBeUndefined()
+  expect(await ui.find({ key: 'claude' })).toBeDefined()
+  await ui.unmount()
+})
+
 test('with no Python, an installed tool says what it needs', async ($, on) => {
   const { argvs } = await start($, on, { missing: ['python3', 'python', 'py'], folders: ['/home/u/.codex'] })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
