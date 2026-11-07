@@ -791,8 +791,9 @@ def shell_segments(command, powershell=False):
                 i = end
                 continue
         elif ch in "<>":
-            # Digits touching the operator name a file descriptor (`2>`), not a word.
-            if not quoted and re.fullmatch(r"[0-9]+", "".join(word)):
+            # What touches the operator names its streams (`2>`, PowerShell's `*>`), not a word.
+            streams = "".join(word)
+            if not quoted and (re.fullmatch(r"[0-9]+", streams) or powershell and streams == "*"):
                 word, started = [], False
             finish_word()
             op = ch
@@ -803,7 +804,8 @@ def shell_segments(command, powershell=False):
                     op += "-"
                     i += 1
             elif command.startswith("&", i + 1):
-                i += 1  # `2>&1`: the `&` belongs to the redirect, the command goes on
+                op += "&"  # `2>&1`, `<&-`: the `&` belongs to the redirect, the command goes on
+                i += 1
             words.append(op)
         else:
             word.append(ch)
@@ -854,7 +856,7 @@ def exec_args(words, env, call):
     positional, i, options = [], 0, True
     while i < len(words):
         word = words[i]
-        if word in ("<", ">", ">>", "<<", "<<-"):
+        if word in ("<", ">", ">>", "<<", "<<-", "<&", ">&"):
             break
         flag, sep, value = word.partition("=")
         if options and word == "--":

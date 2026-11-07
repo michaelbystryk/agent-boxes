@@ -292,6 +292,21 @@ class AttributionTests(Files):
             self.assertEqual(call["brief"], "the brief", command)
             self.assertEqual(set(codex.ours([run], [call])), {"run"}, command)
 
+    def test_closing_an_fd_is_not_reading_a_file(self):
+        (self.root / "-").write_text("not the brief")
+        (self.root / "brief.txt").write_text("the brief")
+        self.assertNotIn("brief", self.call('codex exec "the task" <&-'))
+        self.assertEqual(self.call('codex exec "the task" 0<&- < brief.txt')["brief"], "the brief")
+        self.assertEqual(self.call('cat brief.txt | codex exec "the task" 3<&-')["brief"], "the brief")
+
+    def test_powershell_all_streams_redirect_stays_out_of_the_prompt(self):
+        def prompt(command):
+            return codex.parsed_calls(100000, command, str(self.root), powershell=True)[0]["prompt"]
+        self.assertEqual(prompt('codex exec "the task" *>&1'), "the task")
+        self.assertEqual(prompt('codex exec "the task" *> log.txt'), "the task")
+        self.assertEqual(prompt('codex exec "*"> log.txt'), "*")
+        self.assertEqual(self.call('codex exec "the task" *> log.txt')["prompt"], "the task *")
+
     def test_fd_duplication_does_not_end_the_command(self):
         (self.root / "brief.txt").write_text("the brief")
         self.assertEqual(self.call("cat brief.txt 2>&1 | codex exec -")["brief"], "the brief")
